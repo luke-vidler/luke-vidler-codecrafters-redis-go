@@ -199,6 +199,60 @@ func compareEntryIDs(id1, id2 string) (int, error) {
 	}
 }
 
+// parseRangeID parses a range ID which can be "-", "+", or a normal entry ID
+func parseRangeID(id string) (int64, int64, bool, error) {
+	switch id {
+	case "-":
+		// Minimum possible ID
+		return 0, 0, false, nil
+	case "+":
+		// Maximum possible ID (use max int64 values)
+		return 9223372036854775807, 9223372036854775807, false, nil
+	default:
+		// Normal entry ID
+		timestamp, sequence, err := parseEntryID(id)
+		return timestamp, sequence, false, err
+	}
+}
+
+// filterStreamEntries filters stream entries within the inclusive range [start, end]
+func filterStreamEntries(stream []streamEntry, startID, endID string) ([]streamEntry, error) {
+	startTs, startSeq, _, err := parseRangeID(startID)
+	if err != nil {
+		return nil, err
+	}
+
+	endTs, endSeq, _, err := parseRangeID(endID)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []streamEntry
+	for _, entry := range stream {
+		entryTs, entrySeq, err := parseEntryID(entry.id)
+		if err != nil {
+			continue
+		}
+
+		// Check if entry is within range (inclusive)
+		inRange := false
+
+		// Check if entry >= start
+		if entryTs > startTs || (entryTs == startTs && entrySeq >= startSeq) {
+			// Check if entry <= end
+			if entryTs < endTs || (entryTs == endTs && entrySeq <= endSeq) {
+				inRange = true
+			}
+		}
+
+		if inRange {
+			result = append(result, entry)
+		}
+	}
+
+	return result, nil
+}
+
 func notifyBlockedClients(key string) {
 	blockedMutex.Lock()
 	defer blockedMutex.Unlock()
@@ -715,6 +769,44 @@ func handleClient(conn net.Conn) {
 					response := fmt.Sprintf("+%s\r\n", dataType)
 					conn.Write([]byte(response))
 				}
+			}
+		case "XRANGE":
+			if len(args) >= 4 {
+				key := args[1]
+				startID := args[2]
+				endID := args[3]
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				if !exists {
+					// Stream doesn't exist, return empty array
+					conn.Write([]byte("*0\r\n"))
+					continue
+				}
+
+				// Filter entries within the range
+				filteredEntries, err := filterStreamEntries(item.stream, startID, endID)
+				if err != nil {
+					conn.Write([]byte("-ERR invalid range ID format\r\n"))
+					continue
+				}
+
+				// Build RESP array response
+				response := fmt.Sprintf("*%d\r\n", len(filteredEntries))
+				for _, entry := range filteredEntries {
+					// Each entry is an array: [id, [field1, value1, field2, value2, ...]]
+					fieldCount := len(entry.fields) * 2
+					response += fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(entry.id), entry.id, fieldCount)
+
+					// Add field-value pairs
+					for field, value := range entry.fields {
+						response += fmt.Sprintf("$%d\r\n%s\r\n$%d\r\n%s\r\n", len(field), field, len(value), value)
+					}
+				}
+
+				conn.Write([]byte(response))
 			}
 		}
 	}
