@@ -17,6 +17,7 @@ var _ = os.Exit
 
 type storeItem struct {
 	value  string
+	list   []string
 	expiry *time.Time
 }
 
@@ -144,6 +145,28 @@ func handleClient(conn net.Conn) {
 					}
 					conn.Write([]byte("$-1\r\n"))
 				}
+			}
+		case "RPUSH":
+			if len(args) >= 3 {
+				key := args[1]
+				element := args[2]
+
+				storeMutex.Lock()
+				item, exists := store[key]
+				if !exists {
+					// Create new list with single element
+					store[key] = storeItem{list: []string{element}}
+				} else {
+					// Append to existing list
+					item.list = append(item.list, element)
+					store[key] = item
+				}
+				listLen := len(store[key].list)
+				storeMutex.Unlock()
+
+				// Return the number of elements in the list as RESP integer
+				response := fmt.Sprintf(":%d\r\n", listLen)
+				conn.Write([]byte(response))
 			}
 		}
 	}
