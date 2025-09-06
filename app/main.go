@@ -477,6 +477,35 @@ func handleClient(conn net.Conn) {
 				}
 
 			}
+		case "TYPE":
+			if len(args) >= 2 {
+				key := args[1]
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				if !exists {
+					// Key doesn't exist
+					conn.Write([]byte("+none\r\n"))
+				} else {
+					// Determine the type based on which field is populated
+					var dataType string
+					if len(item.list) > 0 {
+						// Has list data
+						dataType = "list"
+					} else if item.value != "" {
+						// Has string data
+						dataType = "string"
+					} else {
+						// Empty/unknown type
+						dataType = "none"
+					}
+
+					response := fmt.Sprintf("+%s\r\n", dataType)
+					conn.Write([]byte(response))
+				}
+			}
 		}
 	}
 }
