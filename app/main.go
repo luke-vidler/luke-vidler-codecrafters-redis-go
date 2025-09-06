@@ -88,6 +88,58 @@ func parseRESP(reader *bufio.Reader) ([]string, error) {
 	return args, nil
 }
 
+// parseEntryID parses a stream entry ID in format "timestamp-sequence"
+func parseEntryID(id string) (int64, int64, error) {
+	parts := strings.Split(id, "-")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid entry ID format")
+	}
+
+	timestamp, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid timestamp in entry ID")
+	}
+
+	sequence, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid sequence number in entry ID")
+	}
+
+	return timestamp, sequence, nil
+}
+
+// compareEntryIDs compares two entry IDs. Returns:
+// -1 if id1 < id2
+//
+//	0 if id1 == id2
+//	1 if id1 > id2
+func compareEntryIDs(id1, id2 string) (int, error) {
+	ts1, seq1, err := parseEntryID(id1)
+	if err != nil {
+		return 0, err
+	}
+
+	ts2, seq2, err := parseEntryID(id2)
+	if err != nil {
+		return 0, err
+	}
+
+	if ts1 < ts2 {
+		return -1, nil
+	} else if ts1 > ts2 {
+		return 1, nil
+	} else {
+		// Same timestamp, compare sequence numbers
+		if seq1 < seq2 {
+			return -1, nil
+		} else if seq1 > seq2 {
+			return 1, nil
+		} else {
+			return 0, nil
+		}
+	}
+}
+
 func notifyBlockedClients(key string) {
 	blockedMutex.Lock()
 	defer blockedMutex.Unlock()
@@ -488,6 +540,24 @@ func handleClient(conn net.Conn) {
 				key := args[1]
 				entryID := args[2]
 
+				// Validate entry ID format
+				_, _, err := parseEntryID(entryID)
+				if err != nil {
+					conn.Write([]byte("-ERR invalid entry ID format\r\n"))
+					continue
+				}
+
+				// Check minimum ID requirement (must be greater than 0-0)
+				cmp, err := compareEntryIDs(entryID, "0-0")
+				if err != nil {
+					conn.Write([]byte("-ERR invalid entry ID format\r\n"))
+					continue
+				}
+				if cmp <= 0 {
+					conn.Write([]byte("-ERR The ID specified in XADD must be greater than 0-0\r\n"))
+					continue
+				}
+
 				// Parse field-value pairs (args[3], args[4], args[5], args[6], ...)
 				fields := make(map[string]string)
 				for i := 3; i < len(args); i += 2 {
@@ -506,6 +576,23 @@ func handleClient(conn net.Conn) {
 
 				storeMutex.Lock()
 				item, exists := store[key]
+
+				// Check if ID is greater than the last entry (if stream exists)
+				if exists && len(item.stream) > 0 {
+					lastEntry := item.stream[len(item.stream)-1]
+					cmp, err := compareEntryIDs(entryID, lastEntry.id)
+					if err != nil {
+						storeMutex.Unlock()
+						conn.Write([]byte("-ERR invalid entry ID format\r\n"))
+						continue
+					}
+					if cmp <= 0 {
+						storeMutex.Unlock()
+						conn.Write([]byte("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"))
+						continue
+					}
+				}
+
 				if !exists {
 					// Create new stream
 					store[key] = storeItem{stream: []streamEntry{entry}}
