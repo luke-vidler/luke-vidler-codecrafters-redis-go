@@ -108,6 +108,58 @@ func parseEntryID(id string) (int64, int64, error) {
 	return timestamp, sequence, nil
 }
 
+// parseEntryIDWithWildcard parses entry ID that might contain * for sequence number
+// Returns (timestamp, sequence, isWildcard, error)
+func parseEntryIDWithWildcard(id string) (int64, int64, bool, error) {
+	parts := strings.Split(id, "-")
+	if len(parts) != 2 {
+		return 0, 0, false, fmt.Errorf("invalid entry ID format")
+	}
+
+	timestamp, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("invalid timestamp in entry ID")
+	}
+
+	if parts[1] == "*" {
+		return timestamp, 0, true, nil
+	}
+
+	sequence, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("invalid sequence number in entry ID")
+	}
+
+	return timestamp, sequence, false, nil
+}
+
+// generateSequenceNumber generates the next sequence number for a given timestamp
+func generateSequenceNumber(stream []streamEntry, timestamp int64) int64 {
+	// Special case: if timestamp is 0, default sequence is 1
+	defaultSeq := int64(0)
+	if timestamp == 0 {
+		defaultSeq = 1
+	}
+
+	// Find the highest sequence number for this timestamp
+	highestSeq := int64(-1)
+	for _, entry := range stream {
+		entryTs, entrySeq, err := parseEntryID(entry.id)
+		if err != nil {
+			continue
+		}
+		if entryTs == timestamp && entrySeq > highestSeq {
+			highestSeq = entrySeq
+		}
+	}
+
+	if highestSeq == -1 {
+		return defaultSeq
+	}
+
+	return highestSeq + 1
+}
+
 // compareEntryIDs compares two entry IDs. Returns:
 // -1 if id1 < id2
 //
@@ -540,15 +592,33 @@ func handleClient(conn net.Conn) {
 				key := args[1]
 				entryID := args[2]
 
-				// Validate entry ID format
-				_, _, err := parseEntryID(entryID)
+				// Parse entry ID (might contain wildcard)
+				timestamp, sequence, isWildcard, err := parseEntryIDWithWildcard(entryID)
 				if err != nil {
 					conn.Write([]byte("-ERR invalid entry ID format\r\n"))
 					continue
 				}
 
+				// Handle wildcard sequence number generation
+				var finalEntryID string
+				if isWildcard {
+					// Need to access store to generate sequence number
+					storeMutex.RLock()
+					item, exists := store[key]
+					var stream []streamEntry
+					if exists {
+						stream = item.stream
+					}
+					storeMutex.RUnlock()
+
+					sequence = generateSequenceNumber(stream, timestamp)
+					finalEntryID = fmt.Sprintf("%d-%d", timestamp, sequence)
+				} else {
+					finalEntryID = entryID
+				}
+
 				// Check minimum ID requirement (must be greater than 0-0)
-				cmp, err := compareEntryIDs(entryID, "0-0")
+				cmp, err := compareEntryIDs(finalEntryID, "0-0")
 				if err != nil {
 					conn.Write([]byte("-ERR invalid entry ID format\r\n"))
 					continue
@@ -570,7 +640,7 @@ func handleClient(conn net.Conn) {
 
 				// Create the stream entry
 				entry := streamEntry{
-					id:     entryID,
+					id:     finalEntryID,
 					fields: fields,
 				}
 
@@ -580,7 +650,7 @@ func handleClient(conn net.Conn) {
 				// Check if ID is greater than the last entry (if stream exists)
 				if exists && len(item.stream) > 0 {
 					lastEntry := item.stream[len(item.stream)-1]
-					cmp, err := compareEntryIDs(entryID, lastEntry.id)
+					cmp, err := compareEntryIDs(finalEntryID, lastEntry.id)
 					if err != nil {
 						storeMutex.Unlock()
 						conn.Write([]byte("-ERR invalid entry ID format\r\n"))
@@ -604,7 +674,7 @@ func handleClient(conn net.Conn) {
 				storeMutex.Unlock()
 
 				// Return the entry ID as a bulk string
-				response := fmt.Sprintf("$%d\r\n%s\r\n", len(entryID), entryID)
+				response := fmt.Sprintf("$%d\r\n%s\r\n", len(finalEntryID), finalEntryID)
 				conn.Write([]byte(response))
 			}
 		case "TYPE":
