@@ -234,6 +234,37 @@ func handleClient(conn net.Conn) {
 
 				conn.Write([]byte(response))
 			}
+		case "LPUSH":
+			if len(args) >= 3 {
+				key := args[1]
+				elements := args[2:] // All elements from index 2 onwards
+
+				storeMutex.Lock()
+				item, exists := store[key]
+				if !exists {
+					// Create new list with all elements (reverse order for left insertion)
+					newList := make([]string, len(elements))
+					for i, element := range elements {
+						newList[len(elements)-1-i] = element
+					}
+					store[key] = storeItem{list: newList}
+				} else {
+					// Prepend all elements to existing list (reverse order for left insertion)
+					newList := make([]string, len(elements)+len(item.list))
+					for i, element := range elements {
+						newList[len(elements)-1-i] = element
+					}
+					copy(newList[len(elements):], item.list)
+					item.list = newList
+					store[key] = item
+				}
+				listLen := len(store[key].list)
+				storeMutex.Unlock()
+
+				// Return the number of elements in the list as RESP integer
+				response := fmt.Sprintf(":%d\r\n", listLen)
+				conn.Write([]byte(response))
+			}
 		}
 	}
 }
