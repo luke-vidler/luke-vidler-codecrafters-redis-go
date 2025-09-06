@@ -108,9 +108,16 @@ func parseEntryID(id string) (int64, int64, error) {
 	return timestamp, sequence, nil
 }
 
-// parseEntryIDWithWildcard parses entry ID that might contain * for sequence number
+// parseEntryIDWithWildcard parses entry ID that might contain * for sequence number or complete *
 // Returns (timestamp, sequence, isWildcard, error)
 func parseEntryIDWithWildcard(id string) (int64, int64, bool, error) {
+	// Handle complete wildcard "*"
+	if id == "*" {
+		// Use current Unix timestamp in milliseconds
+		currentTime := time.Now().UnixMilli()
+		return currentTime, 0, true, nil
+	}
+
 	parts := strings.Split(id, "-")
 	if len(parts) != 2 {
 		return 0, 0, false, fmt.Errorf("invalid entry ID format")
