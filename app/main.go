@@ -403,9 +403,9 @@ func handleClient(conn net.Conn) {
 				key := args[1]
 				timeoutStr := args[2]
 
-				timeout, err := strconv.Atoi(timeoutStr)
+				timeoutFloat, err := strconv.ParseFloat(timeoutStr, 64)
 				if err != nil {
-					conn.Write([]byte("-ERR timeout is not an integer\r\n"))
+					conn.Write([]byte("-ERR timeout is not a float\r\n"))
 					continue
 				}
 
@@ -428,45 +428,54 @@ func handleClient(conn net.Conn) {
 				storeMutex.Unlock()
 
 				// No element available, block the client
-				if timeout == 0 {
-					// Create result channel for this blocked client
-					resultCh := make(chan string, 1)
+				// Create result channel for this blocked client
+				resultCh := make(chan string, 1)
 
-					// Add client to blocked list
+				// Add client to blocked list
+				blockedMutex.Lock()
+				blockedClients[key] = append(blockedClients[key], blockedClient{
+					conn:      conn,
+					listKey:   key,
+					timestamp: time.Now(),
+					resultCh:  resultCh,
+				})
+				blockedMutex.Unlock()
+
+				// Determine timeout duration
+				var timeoutDuration time.Duration
+				if timeoutFloat == 0 {
+					// Infinite timeout
+					timeoutDuration = time.Hour * 24 * 365 // Very long time
+				} else {
+					// Convert seconds to duration
+					timeoutDuration = time.Duration(timeoutFloat * float64(time.Second))
+				}
+
+				// Wait for result from channel or timeout
+				select {
+				case response := <-resultCh:
+					// Got unblocked, send response
+					conn.Write([]byte(response))
+				case <-time.After(timeoutDuration):
+					// Timeout expired, remove from blocked clients and send null
 					blockedMutex.Lock()
-					blockedClients[key] = append(blockedClients[key], blockedClient{
-						conn:      conn,
-						listKey:   key,
-						timestamp: time.Now(),
-						resultCh:  resultCh,
-					})
-					blockedMutex.Unlock()
-
-					// Wait for result from channel or connection close
-					select {
-					case response := <-resultCh:
-						// Got unblocked, send response
-						conn.Write([]byte(response))
-					case <-time.After(time.Hour): // Very long timeout to detect connection issues
-						// Remove from blocked clients if still there
-						blockedMutex.Lock()
-						if clients, exists := blockedClients[key]; exists {
-							for i, client := range clients {
-								if client.conn == conn {
-									blockedClients[key] = append(clients[:i], clients[i+1:]...)
-									if len(blockedClients[key]) == 0 {
-										delete(blockedClients, key)
-									}
-									break
+					if clients, exists := blockedClients[key]; exists {
+						for i, client := range clients {
+							if client.conn == conn {
+								blockedClients[key] = append(clients[:i], clients[i+1:]...)
+								if len(blockedClients[key]) == 0 {
+									delete(blockedClients, key)
 								}
+								break
 							}
 						}
-						blockedMutex.Unlock()
 					}
-				} else {
-					// TODO: Handle timeout > 0 in future stage
-					conn.Write([]byte("$-1\r\n"))
+					blockedMutex.Unlock()
+
+					// Send null array for timeout
+					conn.Write([]byte("*-1\r\n"))
 				}
+
 			}
 		}
 	}
