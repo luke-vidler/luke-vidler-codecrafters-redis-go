@@ -8,14 +8,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Ensures gofmt doesn't remove the "net" and "os" imports in stage 1 (feel free to remove this!)
 var _ = net.Listen
 var _ = os.Exit
 
+type storeItem struct {
+	value  string
+	expiry *time.Time
+}
+
 var (
-	store      = make(map[string]string)
+	store      = make(map[string]storeItem)
 	storeMutex sync.RWMutex
 )
 
@@ -96,9 +102,22 @@ func handleClient(conn net.Conn) {
 			if len(args) >= 3 {
 				key := args[1]
 				value := args[2]
+				var expiry *time.Time
+
+				// Parse PX option
+				for i := 3; i < len(args)-1; i++ {
+					if strings.ToUpper(args[i]) == "PX" && i+1 < len(args) {
+						if expiryMs, err := strconv.Atoi(args[i+1]); err == nil {
+							expiryTime := time.Now().Add(time.Duration(expiryMs) * time.Millisecond)
+							expiry = &expiryTime
+
+						}
+						break
+					}
+				}
 
 				storeMutex.Lock()
-				store[key] = value
+				store[key] = storeItem{value: value, expiry: expiry}
 				storeMutex.Unlock()
 
 				conn.Write([]byte("+OK\r\n"))
@@ -108,13 +127,21 @@ func handleClient(conn net.Conn) {
 				key := args[1]
 
 				storeMutex.RLock()
-				value, exists := store[key]
+				item, exists := store[key]
 				storeMutex.RUnlock()
 
-				if exists {
-					response := fmt.Sprintf("$%d\r\n%s\r\n", len(value), value)
+				// Check if key exists and is not expired
+				if exists && (item.expiry == nil || item.expiry.After(time.Now())) {
+					response := fmt.Sprintf("$%d\r\n%s\r\n", len(item.value), item.value)
 					conn.Write([]byte(response))
 				} else {
+					// If expired, remove from store
+					if exists && item.expiry != nil && !item.expiry.After(time.Now()) {
+						storeMutex.Lock()
+						delete(store, key)
+						storeMutex.Unlock()
+
+					}
 					conn.Write([]byte("$-1\r\n"))
 				}
 			}
