@@ -1,1 +1,6 @@
 ./main
+main
+*.exe
+*.out
+*.test
+debug_test.go
