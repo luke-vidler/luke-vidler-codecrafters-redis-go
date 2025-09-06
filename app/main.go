@@ -286,27 +286,54 @@ func handleClient(conn net.Conn) {
 		case "LPOP":
 			if len(args) >= 2 {
 				key := args[1]
+				count := 1 // Default count is 1
+
+				// Parse optional count argument
+				if len(args) >= 3 {
+					if parsedCount, err := strconv.Atoi(args[2]); err == nil && parsedCount > 0 {
+						count = parsedCount
+					}
+				}
 
 				storeMutex.Lock()
 				item, exists := store[key]
 
 				if !exists || len(item.list) == 0 {
-					// List doesn't exist or is empty, return null bulk string
+					// List doesn't exist or is empty
 					storeMutex.Unlock()
-					conn.Write([]byte("$-1\r\n"))
+					if count == 1 {
+						// Single element LPOP returns null bulk string
+						conn.Write([]byte("$-1\r\n"))
+					} else {
+						// Multi-element LPOP returns empty array
+						conn.Write([]byte("*0\r\n"))
+					}
 				} else {
-					// Remove and return the first element
-					firstElement := item.list[0]
-					item.list = item.list[1:] // Remove first element
+					// Determine how many elements to actually remove
+					actualCount := count
+					if actualCount > len(item.list) {
+						actualCount = len(item.list)
+					}
 
-					// If list becomes empty, we could remove the key entirely
-					// but Redis keeps empty lists, so we'll keep the empty slice
+					// Extract the elements to remove
+					removedElements := item.list[:actualCount]
+					item.list = item.list[actualCount:] // Remove elements from front
+
 					store[key] = item
 					storeMutex.Unlock()
 
-					// Return the removed element as bulk string
-					response := fmt.Sprintf("$%d\r\n%s\r\n", len(firstElement), firstElement)
-					conn.Write([]byte(response))
+					if count == 1 {
+						// Single element LPOP returns bulk string
+						response := fmt.Sprintf("$%d\r\n%s\r\n", len(removedElements[0]), removedElements[0])
+						conn.Write([]byte(response))
+					} else {
+						// Multi-element LPOP returns array
+						response := fmt.Sprintf("*%d\r\n", len(removedElements))
+						for _, element := range removedElements {
+							response += fmt.Sprintf("$%d\r\n%s\r\n", len(element), element)
+						}
+						conn.Write([]byte(response))
+					}
 				}
 			}
 		}
