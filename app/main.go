@@ -283,6 +283,32 @@ func handleClient(conn net.Conn) {
 					conn.Write([]byte(response))
 				}
 			}
+		case "LPOP":
+			if len(args) >= 2 {
+				key := args[1]
+
+				storeMutex.Lock()
+				item, exists := store[key]
+
+				if !exists || len(item.list) == 0 {
+					// List doesn't exist or is empty, return null bulk string
+					storeMutex.Unlock()
+					conn.Write([]byte("$-1\r\n"))
+				} else {
+					// Remove and return the first element
+					firstElement := item.list[0]
+					item.list = item.list[1:] // Remove first element
+
+					// If list becomes empty, we could remove the key entirely
+					// but Redis keeps empty lists, so we'll keep the empty slice
+					store[key] = item
+					storeMutex.Unlock()
+
+					// Return the removed element as bulk string
+					response := fmt.Sprintf("$%d\r\n%s\r\n", len(firstElement), firstElement)
+					conn.Write([]byte(response))
+				}
+			}
 		}
 	}
 }
