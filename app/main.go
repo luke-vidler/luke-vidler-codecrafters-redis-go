@@ -168,6 +168,55 @@ func handleClient(conn net.Conn) {
 				response := fmt.Sprintf(":%d\r\n", listLen)
 				conn.Write([]byte(response))
 			}
+		case "LRANGE":
+			if len(args) >= 4 {
+				key := args[1]
+				startStr := args[2]
+				endStr := args[3]
+
+				start, startErr := strconv.Atoi(startStr)
+				end, endErr := strconv.Atoi(endStr)
+
+				if startErr != nil || endErr != nil {
+					conn.Write([]byte("-ERR invalid index\r\n"))
+					continue
+				}
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				if !exists || len(item.list) == 0 {
+					// List doesn't exist or is empty, return empty array
+					conn.Write([]byte("*0\r\n"))
+					continue
+				}
+
+				listLen := len(item.list)
+
+				// Handle edge cases
+				if start >= listLen || start > end {
+					// Start index out of bounds or start > end, return empty array
+					conn.Write([]byte("*0\r\n"))
+					continue
+				}
+
+				// Adjust end index if it's beyond the list length
+				if end >= listLen {
+					end = listLen - 1
+				}
+
+				// Extract the slice
+				result := item.list[start : end+1]
+
+				// Build RESP array response
+				response := fmt.Sprintf("*%d\r\n", len(result))
+				for _, element := range result {
+					response += fmt.Sprintf("$%d\r\n%s\r\n", len(element), element)
+				}
+
+				conn.Write([]byte(response))
+			}
 		}
 	}
 }
