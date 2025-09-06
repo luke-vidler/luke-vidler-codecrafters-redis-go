@@ -265,6 +265,24 @@ func handleClient(conn net.Conn) {
 				response := fmt.Sprintf(":%d\r\n", listLen)
 				conn.Write([]byte(response))
 			}
+		case "LLEN":
+			if len(args) >= 2 {
+				key := args[1]
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				if !exists {
+					// List doesn't exist, return 0
+					conn.Write([]byte(":0\r\n"))
+				} else {
+					// Return the length of the list
+					listLen := len(item.list)
+					response := fmt.Sprintf(":%d\r\n", listLen)
+					conn.Write([]byte(response))
+				}
+			}
 		}
 	}
 }
