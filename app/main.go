@@ -149,16 +149,16 @@ func handleClient(conn net.Conn) {
 		case "RPUSH":
 			if len(args) >= 3 {
 				key := args[1]
-				element := args[2]
+				elements := args[2:] // All elements from index 2 onwards
 
 				storeMutex.Lock()
 				item, exists := store[key]
 				if !exists {
-					// Create new list with single element
-					store[key] = storeItem{list: []string{element}}
+					// Create new list with all elements
+					store[key] = storeItem{list: elements}
 				} else {
-					// Append to existing list
-					item.list = append(item.list, element)
+					// Append all elements to existing list
+					item.list = append(item.list, elements...)
 					store[key] = item
 				}
 				listLen := len(store[key].list)
