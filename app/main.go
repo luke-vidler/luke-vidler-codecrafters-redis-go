@@ -194,6 +194,23 @@ func handleClient(conn net.Conn) {
 
 				listLen := len(item.list)
 
+				// Convert negative indexes to positive indexes
+				if start < 0 {
+					start = listLen + start
+					// If still negative after conversion, treat as 0
+					if start < 0 {
+						start = 0
+					}
+				}
+
+				if end < 0 {
+					end = listLen + end
+					// If still negative after conversion, treat as 0
+					if end < 0 {
+						end = 0
+					}
+				}
+
 				// Handle edge cases
 				if start >= listLen || start > end {
 					// Start index out of bounds or start > end, return empty array
