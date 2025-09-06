@@ -21,9 +21,18 @@ type storeItem struct {
 	expiry *time.Time
 }
 
+type blockedClient struct {
+	conn      net.Conn
+	listKey   string
+	timestamp time.Time
+	resultCh  chan string // Channel to send result when unblocked
+}
+
 var (
-	store      = make(map[string]storeItem)
-	storeMutex sync.RWMutex
+	store          = make(map[string]storeItem)
+	storeMutex     sync.RWMutex
+	blockedClients = make(map[string][]blockedClient) // key -> list of blocked clients
+	blockedMutex   sync.RWMutex
 )
 
 func parseRESP(reader *bufio.Reader) ([]string, error) {
@@ -71,6 +80,47 @@ func parseRESP(reader *bufio.Reader) ([]string, error) {
 	}
 
 	return args, nil
+}
+
+func notifyBlockedClients(key string) {
+	blockedMutex.Lock()
+	defer blockedMutex.Unlock()
+
+	clients, exists := blockedClients[key]
+	if !exists || len(clients) == 0 {
+		return
+	}
+
+	// Process the first (longest waiting) blocked client
+	client := clients[0]
+	blockedClients[key] = clients[1:] // Remove the first client
+
+	// If no more clients, remove the key
+	if len(blockedClients[key]) == 0 {
+		delete(blockedClients, key)
+	}
+
+	// Try to pop an element for the unblocked client (synchronously)
+	storeMutex.Lock()
+	item, exists := store[key]
+	if exists && len(item.list) > 0 {
+		element := item.list[0]
+		item.list = item.list[1:]
+		store[key] = item
+		storeMutex.Unlock()
+
+		// Send response through channel
+		response := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+			len(client.listKey), client.listKey, len(element), element)
+
+		select {
+		case client.resultCh <- response:
+		default:
+			// Client might be gone, ignore
+		}
+	} else {
+		storeMutex.Unlock()
+	}
 }
 
 func handleClient(conn net.Conn) {
@@ -153,6 +203,7 @@ func handleClient(conn net.Conn) {
 
 				storeMutex.Lock()
 				item, exists := store[key]
+				wasEmpty := !exists || len(item.list) == 0
 				if !exists {
 					// Create new list with all elements
 					store[key] = storeItem{list: elements}
@@ -163,6 +214,11 @@ func handleClient(conn net.Conn) {
 				}
 				listLen := len(store[key].list)
 				storeMutex.Unlock()
+
+				// Notify blocked clients if the list was empty before
+				if wasEmpty {
+					notifyBlockedClients(key)
+				}
 
 				// Return the number of elements in the list as RESP integer
 				response := fmt.Sprintf(":%d\r\n", listLen)
@@ -241,6 +297,7 @@ func handleClient(conn net.Conn) {
 
 				storeMutex.Lock()
 				item, exists := store[key]
+				wasEmpty := !exists || len(item.list) == 0
 				if !exists {
 					// Create new list with all elements (reverse order for left insertion)
 					newList := make([]string, len(elements))
@@ -260,6 +317,11 @@ func handleClient(conn net.Conn) {
 				}
 				listLen := len(store[key].list)
 				storeMutex.Unlock()
+
+				// Notify blocked clients if the list was empty before
+				if wasEmpty {
+					notifyBlockedClients(key)
+				}
 
 				// Return the number of elements in the list as RESP integer
 				response := fmt.Sprintf(":%d\r\n", listLen)
@@ -334,6 +396,76 @@ func handleClient(conn net.Conn) {
 						}
 						conn.Write([]byte(response))
 					}
+				}
+			}
+		case "BLPOP":
+			if len(args) >= 3 {
+				key := args[1]
+				timeoutStr := args[2]
+
+				timeout, err := strconv.Atoi(timeoutStr)
+				if err != nil {
+					conn.Write([]byte("-ERR timeout is not an integer\r\n"))
+					continue
+				}
+
+				// Check if there's an element available immediately
+				storeMutex.Lock()
+				item, exists := store[key]
+				if exists && len(item.list) > 0 {
+					// Element available, pop it immediately
+					element := item.list[0]
+					item.list = item.list[1:]
+					store[key] = item
+					storeMutex.Unlock()
+
+					// Return [list_key, element] as RESP array
+					response := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+						len(key), key, len(element), element)
+					conn.Write([]byte(response))
+					continue
+				}
+				storeMutex.Unlock()
+
+				// No element available, block the client
+				if timeout == 0 {
+					// Create result channel for this blocked client
+					resultCh := make(chan string, 1)
+
+					// Add client to blocked list
+					blockedMutex.Lock()
+					blockedClients[key] = append(blockedClients[key], blockedClient{
+						conn:      conn,
+						listKey:   key,
+						timestamp: time.Now(),
+						resultCh:  resultCh,
+					})
+					blockedMutex.Unlock()
+
+					// Wait for result from channel or connection close
+					select {
+					case response := <-resultCh:
+						// Got unblocked, send response
+						conn.Write([]byte(response))
+					case <-time.After(time.Hour): // Very long timeout to detect connection issues
+						// Remove from blocked clients if still there
+						blockedMutex.Lock()
+						if clients, exists := blockedClients[key]; exists {
+							for i, client := range clients {
+								if client.conn == conn {
+									blockedClients[key] = append(clients[:i], clients[i+1:]...)
+									if len(blockedClients[key]) == 0 {
+										delete(blockedClients, key)
+									}
+									break
+								}
+							}
+						}
+						blockedMutex.Unlock()
+					}
+				} else {
+					// TODO: Handle timeout > 0 in future stage
+					conn.Write([]byte("$-1\r\n"))
 				}
 			}
 		}
