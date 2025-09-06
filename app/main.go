@@ -15,9 +15,15 @@ import (
 var _ = net.Listen
 var _ = os.Exit
 
+type streamEntry struct {
+	id     string
+	fields map[string]string
+}
+
 type storeItem struct {
 	value  string
 	list   []string
+	stream []streamEntry
 	expiry *time.Time
 }
 
@@ -477,6 +483,43 @@ func handleClient(conn net.Conn) {
 				}
 
 			}
+		case "XADD":
+			if len(args) >= 5 && len(args)%2 == 1 { // Must have odd number: XADD key id field1 value1 [field2 value2 ...]
+				key := args[1]
+				entryID := args[2]
+
+				// Parse field-value pairs (args[3], args[4], args[5], args[6], ...)
+				fields := make(map[string]string)
+				for i := 3; i < len(args); i += 2 {
+					if i+1 < len(args) {
+						fieldName := args[i]
+						fieldValue := args[i+1]
+						fields[fieldName] = fieldValue
+					}
+				}
+
+				// Create the stream entry
+				entry := streamEntry{
+					id:     entryID,
+					fields: fields,
+				}
+
+				storeMutex.Lock()
+				item, exists := store[key]
+				if !exists {
+					// Create new stream
+					store[key] = storeItem{stream: []streamEntry{entry}}
+				} else {
+					// Append to existing stream
+					item.stream = append(item.stream, entry)
+					store[key] = item
+				}
+				storeMutex.Unlock()
+
+				// Return the entry ID as a bulk string
+				response := fmt.Sprintf("$%d\r\n%s\r\n", len(entryID), entryID)
+				conn.Write([]byte(response))
+			}
 		case "TYPE":
 			if len(args) >= 2 {
 				key := args[1]
@@ -491,7 +534,10 @@ func handleClient(conn net.Conn) {
 				} else {
 					// Determine the type based on which field is populated
 					var dataType string
-					if len(item.list) > 0 {
+					if len(item.stream) > 0 {
+						// Has stream data
+						dataType = "stream"
+					} else if len(item.list) > 0 {
 						// Has list data
 						dataType = "list"
 					} else if item.value != "" {
