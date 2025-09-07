@@ -833,46 +833,66 @@ func handleClient(conn net.Conn) {
 			}
 		case "XREAD":
 			if len(args) >= 4 && args[1] == "streams" {
-				key := args[2]
-				startID := args[3]
+				// Parse stream keys and IDs: XREAD streams key1 key2... id1 id2...
+				// Find the split point between keys and IDs (args are split in half after "streams")
+				streamArgsCount := len(args) - 2 // exclude "XREAD" and "streams"
+				if streamArgsCount%2 != 0 {
+					conn.Write([]byte("-ERR wrong number of arguments\r\n"))
+					continue
+				}
+
+				numStreams := streamArgsCount / 2
+				streamKeys := args[2 : 2+numStreams]
+				streamIDs := args[2+numStreams : 2+streamArgsCount]
+
+				var streamResults []string
 
 				storeMutex.RLock()
-				item, exists := store[key]
-				storeMutex.RUnlock()
+				for i, key := range streamKeys {
+					startID := streamIDs[i]
+					item, exists := store[key]
 
-				if !exists {
-					// Stream doesn't exist, return empty array
-					conn.Write([]byte("*0\r\n"))
-					continue
-				}
+					if !exists {
+						// Stream doesn't exist, skip it
+						continue
+					}
 
-				// Filter entries greater than the start ID (exclusive)
-				filteredEntries, err := filterStreamEntriesGreaterThan(item.stream, startID)
-				if err != nil {
-					conn.Write([]byte("-ERR invalid entry ID format\r\n"))
-					continue
-				}
+					// Filter entries greater than the start ID (exclusive)
+					filteredEntries, err := filterStreamEntriesGreaterThan(item.stream, startID)
+					if err != nil {
+						storeMutex.RUnlock()
+						conn.Write([]byte("-ERR invalid entry ID format\r\n"))
+						continue
+					}
 
-				// Build RESP array response: array of streams, each containing [stream_name, [entries]]
-				if len(filteredEntries) == 0 {
-					conn.Write([]byte("*0\r\n"))
-					continue
-				}
-
-				// Response format: *1 (one stream) *2 (stream name + entries array) $keylen key *entrycount ...
-				response := fmt.Sprintf("*1\r\n*2\r\n$%d\r\n%s\r\n*%d\r\n", len(key), key, len(filteredEntries))
-
-				for _, entry := range filteredEntries {
-					// Each entry is an array: [id, [field1, value1, field2, value2, ...]]
-					fieldCount := len(entry.fields) * 2
-					response += fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(entry.id), entry.id, fieldCount)
-					// Add field-value pairs
-					for field, value := range entry.fields {
-						response += fmt.Sprintf("$%d\r\n%s\r\n$%d\r\n%s\r\n", len(field), field, len(value), value)
+					// Only include streams that have matching entries
+					if len(filteredEntries) > 0 {
+						// Build stream result: [stream_name, [entries]]
+						streamResult := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(key), key, len(filteredEntries))
+						for _, entry := range filteredEntries {
+							// Each entry is an array: [id, [field1, value1, field2, value2, ...]]
+							fieldCount := len(entry.fields) * 2
+							streamResult += fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(entry.id), entry.id, fieldCount)
+							// Add field-value pairs
+							for field, value := range entry.fields {
+								streamResult += fmt.Sprintf("$%d\r\n%s\r\n$%d\r\n%s\r\n", len(field), field, len(value), value)
+							}
+						}
+						streamResults = append(streamResults, streamResult)
 					}
 				}
+				storeMutex.RUnlock()
 
-				conn.Write([]byte(response))
+				// Build final response: array of stream results
+				if len(streamResults) == 0 {
+					conn.Write([]byte("*0\r\n"))
+				} else {
+					response := fmt.Sprintf("*%d\r\n", len(streamResults))
+					for _, streamResult := range streamResults {
+						response += streamResult
+					}
+					conn.Write([]byte(response))
+				}
 			}
 		}
 	}
