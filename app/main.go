@@ -285,6 +285,18 @@ func filterStreamEntriesGreaterThan(stream []streamEntry, startID string) ([]str
 	return result, nil
 }
 
+// resolveStreamID resolves special IDs like "$" to actual entry IDs
+func resolveStreamID(stream []streamEntry, id string) string {
+	if id == "$" {
+		// Return the ID of the last entry in the stream, or "0-0" if stream is empty
+		if len(stream) == 0 {
+			return "0-0"
+		}
+		return stream[len(stream)-1].id
+	}
+	return id
+}
+
 func notifyBlockedClients(key string) {
 	blockedMutex.Lock()
 	defer blockedMutex.Unlock()
@@ -960,8 +972,22 @@ func handleClient(conn net.Conn) {
 				var streamResults []string
 
 				storeMutex.RLock()
+				// First pass: resolve any $ IDs to actual IDs
+				resolvedStreamIDs := make([]string, len(streamIDs))
 				for i, key := range streamKeys {
 					startID := streamIDs[i]
+					item, exists := store[key]
+
+					if !exists {
+						// Stream doesn't exist, treat $ as "0-0"
+						resolvedStreamIDs[i] = resolveStreamID([]streamEntry{}, startID)
+					} else {
+						resolvedStreamIDs[i] = resolveStreamID(item.stream, startID)
+					}
+				}
+
+				for i, key := range streamKeys {
+					startID := resolvedStreamIDs[i]
 					item, exists := store[key]
 
 					if !exists {
@@ -1018,7 +1044,7 @@ func handleClient(conn net.Conn) {
 						blockedStreamClients[key] = append(blockedStreamClients[key], blockedStreamClient{
 							conn:       conn,
 							streamKeys: streamKeys,
-							streamIDs:  streamIDs,
+							streamIDs:  resolvedStreamIDs, // Use resolved IDs instead of original IDs
 							timestamp:  time.Now(),
 							resultCh:   resultCh,
 						})
