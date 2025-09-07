@@ -253,6 +253,29 @@ func filterStreamEntries(stream []streamEntry, startID, endID string) ([]streamE
 	return result, nil
 }
 
+// filterStreamEntriesGreaterThan filters stream entries that are greater than the given ID (exclusive)
+func filterStreamEntriesGreaterThan(stream []streamEntry, startID string) ([]streamEntry, error) {
+	startTs, startSeq, err := parseEntryID(startID)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []streamEntry
+	for _, entry := range stream {
+		entryTs, entrySeq, err := parseEntryID(entry.id)
+		if err != nil {
+			continue
+		}
+
+		// Check if entry > start (exclusive)
+		if entryTs > startTs || (entryTs == startTs && entrySeq > startSeq) {
+			result = append(result, entry)
+		}
+	}
+
+	return result, nil
+}
+
 func notifyBlockedClients(key string) {
 	blockedMutex.Lock()
 	defer blockedMutex.Unlock()
@@ -800,6 +823,49 @@ func handleClient(conn net.Conn) {
 					fieldCount := len(entry.fields) * 2
 					response += fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(entry.id), entry.id, fieldCount)
 
+					// Add field-value pairs
+					for field, value := range entry.fields {
+						response += fmt.Sprintf("$%d\r\n%s\r\n$%d\r\n%s\r\n", len(field), field, len(value), value)
+					}
+				}
+
+				conn.Write([]byte(response))
+			}
+		case "XREAD":
+			if len(args) >= 4 && args[1] == "streams" {
+				key := args[2]
+				startID := args[3]
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				if !exists {
+					// Stream doesn't exist, return empty array
+					conn.Write([]byte("*0\r\n"))
+					continue
+				}
+
+				// Filter entries greater than the start ID (exclusive)
+				filteredEntries, err := filterStreamEntriesGreaterThan(item.stream, startID)
+				if err != nil {
+					conn.Write([]byte("-ERR invalid entry ID format\r\n"))
+					continue
+				}
+
+				// Build RESP array response: array of streams, each containing [stream_name, [entries]]
+				if len(filteredEntries) == 0 {
+					conn.Write([]byte("*0\r\n"))
+					continue
+				}
+
+				// Response format: *1 (one stream) *2 (stream name + entries array) $keylen key *entrycount ...
+				response := fmt.Sprintf("*1\r\n*2\r\n$%d\r\n%s\r\n*%d\r\n", len(key), key, len(filteredEntries))
+
+				for _, entry := range filteredEntries {
+					// Each entry is an array: [id, [field1, value1, field2, value2, ...]]
+					fieldCount := len(entry.fields) * 2
+					response += fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(entry.id), entry.id, fieldCount)
 					// Add field-value pairs
 					for field, value := range entry.fields {
 						response += fmt.Sprintf("$%d\r\n%s\r\n$%d\r\n%s\r\n", len(field), field, len(value), value)
