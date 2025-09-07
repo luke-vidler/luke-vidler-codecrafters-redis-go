@@ -34,11 +34,20 @@ type blockedClient struct {
 	resultCh  chan string // Channel to send result when unblocked
 }
 
+type blockedStreamClient struct {
+	conn       net.Conn
+	streamKeys []string
+	streamIDs  []string
+	timestamp  time.Time
+	resultCh   chan string // Channel to send result when unblocked
+}
+
 var (
-	store          = make(map[string]storeItem)
-	storeMutex     sync.RWMutex
-	blockedClients = make(map[string][]blockedClient) // key -> list of blocked clients
-	blockedMutex   sync.RWMutex
+	store                = make(map[string]storeItem)
+	storeMutex           sync.RWMutex
+	blockedClients       = make(map[string][]blockedClient)       // key -> list of blocked clients
+	blockedStreamClients = make(map[string][]blockedStreamClient) // key -> list of blocked stream clients
+	blockedMutex         sync.RWMutex
 )
 
 func parseRESP(reader *bufio.Reader) ([]string, error) {
@@ -314,6 +323,88 @@ func notifyBlockedClients(key string) {
 		}
 	} else {
 		storeMutex.Unlock()
+	}
+}
+
+func notifyBlockedStreamClients(key string) {
+	blockedMutex.Lock()
+	defer blockedMutex.Unlock()
+
+	clients, exists := blockedStreamClients[key]
+	if !exists || len(clients) == 0 {
+		return
+	}
+
+	// Process all blocked clients for this stream key
+	var remainingClients []blockedStreamClient
+
+	for _, client := range clients {
+		// Check if this client has new entries available
+		hasNewEntries := false
+		var streamResults []string
+
+		storeMutex.RLock()
+		for i, streamKey := range client.streamKeys {
+			if streamKey != key {
+				continue // Only check the stream that was updated
+			}
+
+			startID := client.streamIDs[i]
+			item, exists := store[streamKey]
+
+			if !exists {
+				continue
+			}
+
+			// Filter entries greater than the start ID (exclusive)
+			filteredEntries, err := filterStreamEntriesGreaterThan(item.stream, startID)
+			if err != nil {
+				continue
+			}
+
+			// Only include streams that have matching entries
+			if len(filteredEntries) > 0 {
+				hasNewEntries = true
+				// Build stream result: [stream_name, [entries]]
+				streamResult := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(streamKey), streamKey, len(filteredEntries))
+				for _, entry := range filteredEntries {
+					// Each entry is an array: [id, [field1, value1, field2, value2, ...]]
+					fieldCount := len(entry.fields) * 2
+					streamResult += fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(entry.id), entry.id, fieldCount)
+					// Add field-value pairs
+					for field, value := range entry.fields {
+						streamResult += fmt.Sprintf("$%d\r\n%s\r\n$%d\r\n%s\r\n", len(field), field, len(value), value)
+					}
+				}
+				streamResults = append(streamResults, streamResult)
+				break // Found new entries for this client
+			}
+		}
+		storeMutex.RUnlock()
+
+		if hasNewEntries {
+			// Build final response: array of stream results
+			response := fmt.Sprintf("*%d\r\n", len(streamResults))
+			for _, streamResult := range streamResults {
+				response += streamResult
+			}
+
+			select {
+			case client.resultCh <- response:
+			default:
+				// Client might be gone, ignore
+			}
+		} else {
+			// Keep this client blocked
+			remainingClients = append(remainingClients, client)
+		}
+	}
+
+	// Update the blocked clients list
+	if len(remainingClients) == 0 {
+		delete(blockedStreamClients, key)
+	} else {
+		blockedStreamClients[key] = remainingClients
 	}
 }
 
@@ -757,6 +848,9 @@ func handleClient(conn net.Conn) {
 				}
 				storeMutex.Unlock()
 
+				// Notify blocked stream clients
+				notifyBlockedStreamClients(key)
+
 				// Return the entry ID as a bulk string
 				response := fmt.Sprintf("$%d\r\n%s\r\n", len(finalEntryID), finalEntryID)
 				conn.Write([]byte(response))
@@ -832,18 +926,36 @@ func handleClient(conn net.Conn) {
 				conn.Write([]byte(response))
 			}
 		case "XREAD":
-			if len(args) >= 4 && args[1] == "streams" {
-				// Parse stream keys and IDs: XREAD streams key1 key2... id1 id2...
+			// Handle both: XREAD streams key1 key2... id1 id2...
+			// and: XREAD block timeout streams key1 key2... id1 id2...
+			var blockTimeout float64 = -1 // -1 means no blocking
+			var isBlocking = false
+			var streamsIndex = 1 // Default position of "streams"
+
+			// Check if BLOCK parameter is present
+			if len(args) >= 3 && strings.ToUpper(args[1]) == "BLOCK" {
+				var err error
+				blockTimeout, err = strconv.ParseFloat(args[2], 64)
+				if err != nil {
+					conn.Write([]byte("-ERR timeout is not a float or integer\r\n"))
+					continue
+				}
+				isBlocking = true
+				streamsIndex = 3
+			}
+
+			if len(args) >= streamsIndex+3 && strings.ToUpper(args[streamsIndex]) == "STREAMS" {
+				// Parse stream keys and IDs: XREAD [block timeout] streams key1 key2... id1 id2...
 				// Find the split point between keys and IDs (args are split in half after "streams")
-				streamArgsCount := len(args) - 2 // exclude "XREAD" and "streams"
+				streamArgsCount := len(args) - streamsIndex - 1 // exclude args before "streams" and "streams" itself
 				if streamArgsCount%2 != 0 {
 					conn.Write([]byte("-ERR wrong number of arguments\r\n"))
 					continue
 				}
 
 				numStreams := streamArgsCount / 2
-				streamKeys := args[2 : 2+numStreams]
-				streamIDs := args[2+numStreams : 2+streamArgsCount]
+				streamKeys := args[streamsIndex+1 : streamsIndex+1+numStreams]
+				streamIDs := args[streamsIndex+1+numStreams : streamsIndex+1+streamArgsCount]
 
 				var streamResults []string
 
@@ -883,15 +995,74 @@ func handleClient(conn net.Conn) {
 				}
 				storeMutex.RUnlock()
 
-				// Build final response: array of stream results
-				if len(streamResults) == 0 {
-					conn.Write([]byte("*0\r\n"))
-				} else {
-					response := fmt.Sprintf("*%d\r\n", len(streamResults))
-					for _, streamResult := range streamResults {
-						response += streamResult
+				// If we have results or not blocking, return immediately
+				if len(streamResults) > 0 || !isBlocking {
+					// Build final response: array of stream results
+					if len(streamResults) == 0 {
+						conn.Write([]byte("*0\r\n"))
+					} else {
+						response := fmt.Sprintf("*%d\r\n", len(streamResults))
+						for _, streamResult := range streamResults {
+							response += streamResult
+						}
+						conn.Write([]byte(response))
 					}
-					conn.Write([]byte(response))
+				} else {
+					// No results and blocking requested - block the client
+					// Create result channel for this blocked client
+					resultCh := make(chan string, 1)
+
+					// Add client to blocked list for each stream key
+					blockedMutex.Lock()
+					for _, key := range streamKeys {
+						blockedStreamClients[key] = append(blockedStreamClients[key], blockedStreamClient{
+							conn:       conn,
+							streamKeys: streamKeys,
+							streamIDs:  streamIDs,
+							timestamp:  time.Now(),
+							resultCh:   resultCh,
+						})
+					}
+					blockedMutex.Unlock()
+
+					// Determine timeout duration
+					var timeoutDuration time.Duration
+					if blockTimeout == 0 {
+						// Infinite timeout
+						timeoutDuration = time.Hour * 24 * 365 // Very long time
+					} else {
+						// Convert milliseconds to duration (Redis BLOCK uses milliseconds)
+						timeoutDuration = time.Duration(blockTimeout) * time.Millisecond
+					}
+
+					// Wait for result from channel or timeout
+					select {
+					case response := <-resultCh:
+						// Got unblocked, send response
+						conn.Write([]byte(response))
+					case <-time.After(timeoutDuration):
+						// Timeout expired, remove from all blocked clients lists and send null
+						blockedMutex.Lock()
+						for _, key := range streamKeys {
+							if clients, exists := blockedStreamClients[key]; exists {
+								var remainingClients []blockedStreamClient
+								for _, client := range clients {
+									if client.conn != conn {
+										remainingClients = append(remainingClients, client)
+									}
+								}
+								if len(remainingClients) == 0 {
+									delete(blockedStreamClients, key)
+								} else {
+									blockedStreamClients[key] = remainingClients
+								}
+							}
+						}
+						blockedMutex.Unlock()
+
+						// Send null array for timeout
+						conn.Write([]byte("*-1\r\n"))
+					}
 				}
 			}
 		}
