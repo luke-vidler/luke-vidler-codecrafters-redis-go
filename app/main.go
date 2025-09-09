@@ -1091,6 +1091,41 @@ func handleClient(conn net.Conn) {
 					}
 				}
 			}
+		case "INCR":
+			if len(args) >= 2 {
+				key := args[1]
+
+				storeMutex.Lock()
+				item, exists := store[key]
+
+				// Check if key exists and is not expired
+				if exists && (item.expiry == nil || item.expiry.After(time.Now())) {
+					// Try to parse the current value as an integer
+					currentValue, err := strconv.Atoi(item.value)
+					if err != nil {
+						storeMutex.Unlock()
+						conn.Write([]byte("-ERR value is not an integer or out of range\r\n"))
+						continue
+					}
+
+					// Increment the value
+					newValue := currentValue + 1
+
+					// Store the new value back
+					item.value = strconv.Itoa(newValue)
+					store[key] = item
+					storeMutex.Unlock()
+
+					// Return the new value as a RESP integer
+					response := fmt.Sprintf(":%d\r\n", newValue)
+					conn.Write([]byte(response))
+				} else {
+					storeMutex.Unlock()
+					// For now, we only handle the case where key exists and has numerical value
+					// Later stages will handle non-existent keys
+					conn.Write([]byte("-ERR key does not exist\r\n"))
+				}
+			}
 		}
 	}
 }
