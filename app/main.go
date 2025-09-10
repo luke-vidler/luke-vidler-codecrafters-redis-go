@@ -48,6 +48,8 @@ var (
 	blockedClients       = make(map[string][]blockedClient)       // key -> list of blocked clients
 	blockedStreamClients = make(map[string][]blockedStreamClient) // key -> list of blocked stream clients
 	blockedMutex         sync.RWMutex
+	transactionStates    = make(map[net.Conn]bool) // conn -> is in transaction
+	transactionMutex     sync.RWMutex
 )
 
 func parseRESP(reader *bufio.Reader) ([]string, error) {
@@ -421,7 +423,13 @@ func notifyBlockedStreamClients(key string) {
 }
 
 func handleClient(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		// Clean up transaction state when connection closes
+		transactionMutex.Lock()
+		delete(transactionStates, conn)
+		transactionMutex.Unlock()
+	}()
 	reader := bufio.NewReader(conn)
 
 	for {
@@ -1129,7 +1137,25 @@ func handleClient(conn net.Conn) {
 				}
 			}
 		case "MULTI":
+			transactionMutex.Lock()
+			transactionStates[conn] = true
+			transactionMutex.Unlock()
 			conn.Write([]byte("+OK\r\n"))
+		case "EXEC":
+			transactionMutex.RLock()
+			inTransaction := transactionStates[conn]
+			transactionMutex.RUnlock()
+
+			if !inTransaction {
+				conn.Write([]byte("-ERR EXEC without MULTI\r\n"))
+			} else {
+				// For now, just reset transaction state
+				// Later stages will handle executing queued commands
+				transactionMutex.Lock()
+				delete(transactionStates, conn)
+				transactionMutex.Unlock()
+				conn.Write([]byte("*0\r\n")) // Empty array for now
+			}
 		}
 	}
 }
