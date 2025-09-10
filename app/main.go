@@ -48,7 +48,8 @@ var (
 	blockedClients       = make(map[string][]blockedClient)       // key -> list of blocked clients
 	blockedStreamClients = make(map[string][]blockedStreamClient) // key -> list of blocked stream clients
 	blockedMutex         sync.RWMutex
-	transactionStates    = make(map[net.Conn]bool) // conn -> is in transaction
+	transactionStates    = make(map[net.Conn]bool)       // conn -> is in transaction
+	transactionQueues    = make(map[net.Conn][][]string) // conn -> queue of commands
 	transactionMutex     sync.RWMutex
 )
 
