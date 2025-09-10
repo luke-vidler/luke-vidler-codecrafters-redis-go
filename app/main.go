@@ -1120,10 +1120,12 @@ func handleClient(conn net.Conn) {
 					response := fmt.Sprintf(":%d\r\n", newValue)
 					conn.Write([]byte(response))
 				} else {
+					// Key doesn't exist or is expired, set to 1
+					store[key] = storeItem{value: "1"}
 					storeMutex.Unlock()
-					// For now, we only handle the case where key exists and has numerical value
-					// Later stages will handle non-existent keys
-					conn.Write([]byte("-ERR key does not exist\r\n"))
+
+					// Return 1 as a RESP integer
+					conn.Write([]byte(":1\r\n"))
 				}
 			}
 		}
