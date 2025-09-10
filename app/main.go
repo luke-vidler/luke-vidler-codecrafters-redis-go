@@ -555,7 +555,7 @@ func handleClient(conn net.Conn) {
 		inTransaction := transactionStates[conn]
 		transactionMutex.RUnlock()
 
-		if inTransaction && command != "EXEC" && command != "MULTI" {
+		if inTransaction && command != "EXEC" && command != "MULTI" && command != "DISCARD" {
 			// Queue the command instead of executing it
 			transactionMutex.Lock()
 			transactionQueues[conn] = append(transactionQueues[conn], args)
@@ -1294,6 +1294,22 @@ func handleClient(conn net.Conn) {
 					result += response
 				}
 				conn.Write([]byte(result))
+			}
+		case "DISCARD":
+			transactionMutex.RLock()
+			inTransaction := transactionStates[conn]
+			transactionMutex.RUnlock()
+
+			if !inTransaction {
+				conn.Write([]byte("-ERR DISCARD without MULTI\r\n"))
+			} else {
+				// Clear transaction state and queued commands
+				transactionMutex.Lock()
+				delete(transactionStates, conn)
+				delete(transactionQueues, conn)
+				transactionMutex.Unlock()
+
+				conn.Write([]byte("+OK\r\n"))
 			}
 		}
 	}
