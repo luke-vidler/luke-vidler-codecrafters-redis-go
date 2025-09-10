@@ -1170,6 +1170,7 @@ func handleClient(conn net.Conn) {
 				// Later stages will handle executing queued commands
 				transactionMutex.Lock()
 				delete(transactionStates, conn)
+				delete(transactionQueues, conn)
 				transactionMutex.Unlock()
 				conn.Write([]byte("*0\r\n")) // Empty array for now
 			}
