@@ -429,6 +429,7 @@ func handleClient(conn net.Conn) {
 		// Clean up transaction state when connection closes
 		transactionMutex.Lock()
 		delete(transactionStates, conn)
+		delete(transactionQueues, conn)
 		transactionMutex.Unlock()
 	}()
 	reader := bufio.NewReader(conn)
@@ -445,6 +446,20 @@ func handleClient(conn net.Conn) {
 		}
 
 		command := strings.ToUpper(args[0])
+
+		// Check if we're in a transaction and should queue commands
+		transactionMutex.RLock()
+		inTransaction := transactionStates[conn]
+		transactionMutex.RUnlock()
+
+		if inTransaction && command != "EXEC" && command != "MULTI" {
+			// Queue the command instead of executing it
+			transactionMutex.Lock()
+			transactionQueues[conn] = append(transactionQueues[conn], args)
+			transactionMutex.Unlock()
+			conn.Write([]byte("+QUEUED\r\n"))
+			continue
+		}
 
 		switch command {
 		case "PING":
@@ -1140,6 +1155,7 @@ func handleClient(conn net.Conn) {
 		case "MULTI":
 			transactionMutex.Lock()
 			transactionStates[conn] = true
+			transactionQueues[conn] = make([][]string, 0) // Initialize empty queue
 			transactionMutex.Unlock()
 			conn.Write([]byte("+OK\r\n"))
 		case "EXEC":
