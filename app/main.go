@@ -1128,6 +1128,8 @@ func handleClient(conn net.Conn) {
 					conn.Write([]byte(":1\r\n"))
 				}
 			}
+		case "MULTI":
+			conn.Write([]byte("+OK\r\n"))
 		}
 	}
 }
