@@ -1319,9 +1319,19 @@ func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
 
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+	port := "6379" // Default port
+
+	// Parse command line arguments
+	for i, arg := range os.Args {
+		if arg == "--port" && i+1 < len(os.Args) {
+			port = os.Args[i+1]
+			break
+		}
+	}
+
+	l, err := net.Listen("tcp", "0.0.0.0:"+port)
 	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
+		fmt.Printf("Failed to bind to port %s\n", port)
 		os.Exit(1)
 	}
 
