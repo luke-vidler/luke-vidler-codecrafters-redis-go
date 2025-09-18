@@ -1255,6 +1255,16 @@ func handleClient(conn net.Conn) {
 					conn.Write([]byte(":1\r\n"))
 				}
 			}
+		case "INFO":
+			if len(args) >= 2 && strings.ToLower(args[1]) == "replication" {
+				// Return replication section with role as master
+				info := "role:master"
+				response := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
+				conn.Write([]byte(response))
+			} else {
+				// For now, only support replication section
+				conn.Write([]byte("-ERR unknown section or missing argument\r\n"))
+			}
 		case "MULTI":
 			transactionMutex.Lock()
 			transactionStates[conn] = true
