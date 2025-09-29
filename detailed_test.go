@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"os/exec"
 	"time"
@@ -38,28 +39,50 @@ func testRedisServer(port string, args []string) {
 
 	// Read response
 	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
+
+	// Read the length line
+	lengthLine, err := reader.ReadString('\n')
 	if err != nil {
-		fmt.Printf("Failed to read response: %v\n", err)
+		fmt.Printf("Failed to read length line: %v\n", err)
 		return
 	}
+	fmt.Printf("Length line: %s", lengthLine)
 
-	// Read the next line (actual content)
+	// Read the content
 	content, err := reader.ReadString('\n')
-	if err != nil {
+	if err != nil && err != io.EOF {
 		fmt.Printf("Failed to read content: %v\n", err)
 		return
 	}
 
-	fmt.Printf("Response: %s", response)
-	fmt.Printf("Content: %s", content)
+	fmt.Printf("Full content: %q\n", content)
+	fmt.Printf("Parsed content:\n")
+
+	// Split by \r\n to show individual lines
+	lines := ""
+	for i, char := range content {
+		if char == '\r' {
+			if i+1 < len(content) && rune(content[i+1]) == '\n' {
+				fmt.Printf("  %s\n", lines)
+				lines = ""
+				continue
+			}
+		} else if char == '\n' && i > 0 && rune(content[i-1]) == '\r' {
+			continue
+		} else if char != '\n' {
+			lines += string(char)
+		}
+	}
+	if lines != "" {
+		fmt.Printf("  %s\n", lines)
+	}
 }
 
 func main() {
 	// Test master mode
-	fmt.Println("Testing master mode...")
+	fmt.Println("=== Testing master mode ===")
 	testRedisServer("6380", []string{"--port", "6380"})
 
-	fmt.Println("\nTesting replica mode...")
+	fmt.Println("\n=== Testing replica mode ===")
 	testRedisServer("6381", []string{"--port", "6381", "--replicaof", "localhost 6379"})
 }

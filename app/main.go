@@ -51,9 +51,11 @@ var (
 	transactionStates    = make(map[net.Conn]bool)       // conn -> is in transaction
 	transactionQueues    = make(map[net.Conn][][]string) // conn -> queue of commands
 	transactionMutex     sync.RWMutex
-	isReplica            = false // Track if server is running as a replica
-	masterHost           = ""    // Master host if running as replica
-	masterPort           = ""    // Master port if running as replica
+	isReplica            = false                                      // Track if server is running as a replica
+	masterHost           = ""                                         // Master host if running as replica
+	masterPort           = ""                                         // Master port if running as replica
+	masterReplid         = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb" // Hardcoded replication ID for master
+	masterReplOffset     = 0                                          // Replication offset for master
 )
 
 func parseRESP(reader *bufio.Reader) ([]string, error) {
@@ -1265,7 +1267,7 @@ func handleClient(conn net.Conn) {
 				if isReplica {
 					info = "role:slave"
 				} else {
-					info = "role:master"
+					info = fmt.Sprintf("role:master\r\nmaster_replid:%s\r\nmaster_repl_offset:%d", masterReplid, masterReplOffset)
 				}
 				response := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
 				conn.Write([]byte(response))
