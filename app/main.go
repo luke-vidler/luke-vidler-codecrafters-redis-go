@@ -51,6 +51,9 @@ var (
 	transactionStates    = make(map[net.Conn]bool)       // conn -> is in transaction
 	transactionQueues    = make(map[net.Conn][][]string) // conn -> queue of commands
 	transactionMutex     sync.RWMutex
+	isReplica            = false // Track if server is running as a replica
+	masterHost           = ""    // Master host if running as replica
+	masterPort           = ""    // Master port if running as replica
 )
 
 func parseRESP(reader *bufio.Reader) ([]string, error) {
@@ -1257,8 +1260,13 @@ func handleClient(conn net.Conn) {
 			}
 		case "INFO":
 			if len(args) >= 2 && strings.ToLower(args[1]) == "replication" {
-				// Return replication section with role as master
-				info := "role:master"
+				// Return replication section with appropriate role
+				var info string
+				if isReplica {
+					info = "role:slave"
+				} else {
+					info = "role:master"
+				}
 				response := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
 				conn.Write([]byte(response))
 			} else {
@@ -1335,7 +1343,15 @@ func main() {
 	for i, arg := range os.Args {
 		if arg == "--port" && i+1 < len(os.Args) {
 			port = os.Args[i+1]
-			break
+		} else if arg == "--replicaof" && i+1 < len(os.Args) {
+			// Parse master host and port from next argument
+			replicaofValue := os.Args[i+1]
+			parts := strings.Split(replicaofValue, " ")
+			if len(parts) == 2 {
+				isReplica = true
+				masterHost = parts[0]
+				masterPort = parts[1]
+			}
 		}
 	}
 
