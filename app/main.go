@@ -1418,6 +1418,22 @@ func main() {
 				return
 			}
 
+			// Step 4: Send PSYNC ? -1
+			psyncCmd := "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+			_, err = masterConn.Write([]byte(psyncCmd))
+			if err != nil {
+				fmt.Printf("Failed to send PSYNC: %s\n", err.Error())
+				return
+			}
+			fmt.Println("Sent PSYNC ? -1")
+
+			// Read PSYNC response
+			_, err = reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Failed to read PSYNC response: %s\n", err.Error())
+				return
+			}
+
 			fmt.Println("Handshake completed successfully")
 		}()
 	}
