@@ -1536,8 +1536,21 @@ func main() {
 				}
 
 				// Process the command but don't send a response
+				// Exception: REPLCONF GETACK requires a response
 				command := strings.ToUpper(args[0])
 				switch command {
+				case "REPLCONF":
+					// Handle REPLCONF GETACK command
+					if len(args) >= 2 && strings.ToUpper(args[1]) == "GETACK" {
+						// Respond with REPLCONF ACK <offset>
+						// For now, hardcode offset to 0
+						ackResponse := "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n"
+						_, err := masterConn.Write([]byte(ackResponse))
+						if err != nil {
+							fmt.Printf("Failed to send ACK response: %s\n", err.Error())
+						}
+						fmt.Println("Sent REPLCONF ACK 0")
+					}
 				case "SET":
 					if len(args) >= 3 {
 						key := args[1]
