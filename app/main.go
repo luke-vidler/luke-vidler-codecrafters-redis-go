@@ -58,6 +58,8 @@ var (
 	masterReplOffset     = 0                                          // Replication offset for master
 	replicas             []net.Conn                                   // List of connected replicas
 	replicasMutex        sync.RWMutex
+	replicaOffset        = 0 // Offset for replica - number of bytes of commands processed
+	replicaOffsetMutex   sync.Mutex
 )
 
 // propagateToReplicas sends a command to all connected replicas
@@ -126,6 +128,59 @@ func parseRESP(reader *bufio.Reader) ([]string, error) {
 	}
 
 	return args, nil
+}
+
+// parseRESPWithBytes parses RESP and returns both the parsed args and the number of bytes read
+func parseRESPWithBytes(reader *bufio.Reader) ([]string, int, error) {
+	bytesRead := 0
+
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, 0, err
+	}
+	bytesRead += len(line)
+
+	line = strings.TrimRight(line, "\r\n")
+
+	if !strings.HasPrefix(line, "*") {
+		return nil, 0, fmt.Errorf("expected array, got %s", line)
+	}
+
+	arrayLen, err := strconv.Atoi(line[1:])
+	if err != nil {
+		return nil, 0, err
+	}
+
+	args := make([]string, arrayLen)
+
+	for i := 0; i < arrayLen; i++ {
+		line, err = reader.ReadString('\n')
+		if err != nil {
+			return nil, 0, err
+		}
+		bytesRead += len(line)
+
+		line = strings.TrimRight(line, "\r\n")
+
+		if !strings.HasPrefix(line, "$") {
+			return nil, 0, fmt.Errorf("expected bulk string, got %s", line)
+		}
+
+		strLen, err := strconv.Atoi(line[1:])
+		if err != nil {
+			return nil, 0, err
+		}
+
+		str, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, 0, err
+		}
+		bytesRead += len(str)
+
+		args[i] = strings.TrimRight(str, "\r\n")[:strLen]
+	}
+
+	return args, bytesRead, nil
 }
 
 // parseEntryID parses a stream entry ID in format "timestamp-sequence"
@@ -1525,7 +1580,7 @@ func main() {
 
 			// Now keep listening for commands from the master
 			for {
-				args, err := parseRESP(reader)
+				args, bytesRead, err := parseRESPWithBytes(reader)
 				if err != nil {
 					fmt.Printf("Error parsing command from master: %s\n", err.Error())
 					break
@@ -1542,15 +1597,36 @@ func main() {
 				case "REPLCONF":
 					// Handle REPLCONF GETACK command
 					if len(args) >= 2 && strings.ToUpper(args[1]) == "GETACK" {
+						// Get current offset before updating it
+						replicaOffsetMutex.Lock()
+						currentOffset := replicaOffset
+						replicaOffsetMutex.Unlock()
+
 						// Respond with REPLCONF ACK <offset>
-						// For now, hardcode offset to 0
-						ackResponse := "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n"
+						offsetStr := strconv.Itoa(currentOffset)
+						ackResponse := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
 						_, err := masterConn.Write([]byte(ackResponse))
 						if err != nil {
 							fmt.Printf("Failed to send ACK response: %s\n", err.Error())
 						}
-						fmt.Println("Sent REPLCONF ACK 0")
+						fmt.Printf("Sent REPLCONF ACK %d\n", currentOffset)
+
+						// Now update the offset to include this REPLCONF GETACK command
+						replicaOffsetMutex.Lock()
+						replicaOffset += bytesRead
+						replicaOffsetMutex.Unlock()
+					} else {
+						// Other REPLCONF commands (not GETACK) - just update offset
+						replicaOffsetMutex.Lock()
+						replicaOffset += bytesRead
+						replicaOffsetMutex.Unlock()
 					}
+				case "PING":
+					// PING command from master - just update offset
+					replicaOffsetMutex.Lock()
+					replicaOffset += bytesRead
+					replicaOffsetMutex.Unlock()
+					fmt.Println("Replica processed PING")
 				case "SET":
 					if len(args) >= 3 {
 						key := args[1]
@@ -1574,9 +1650,18 @@ func main() {
 
 						fmt.Printf("Replica processed SET %s %s\n", key, value)
 					}
+
+					// Update offset for SET command
+					replicaOffsetMutex.Lock()
+					replicaOffset += bytesRead
+					replicaOffsetMutex.Unlock()
 				// Add other write commands here as needed
 				default:
 					fmt.Printf("Replica received command: %s\n", command)
+					// Update offset for unknown commands too
+					replicaOffsetMutex.Lock()
+					replicaOffset += bytesRead
+					replicaOffsetMutex.Unlock()
 				}
 			}
 		}()
