@@ -56,7 +56,30 @@ var (
 	masterPort           = ""                                         // Master port if running as replica
 	masterReplid         = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb" // Hardcoded replication ID for master
 	masterReplOffset     = 0                                          // Replication offset for master
+	replicas             []net.Conn                                   // List of connected replicas
+	replicasMutex        sync.RWMutex
 )
+
+// propagateToReplicas sends a command to all connected replicas
+func propagateToReplicas(args []string) {
+	if len(args) == 0 {
+		return
+	}
+
+	// Build RESP array for the command
+	resp := fmt.Sprintf("*%d\r\n", len(args))
+	for _, arg := range args {
+		resp += fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
+	}
+
+	replicasMutex.RLock()
+	defer replicasMutex.RUnlock()
+
+	// Send to all replicas
+	for _, replica := range replicas {
+		replica.Write([]byte(resp))
+	}
+}
 
 func parseRESP(reader *bufio.Reader) ([]string, error) {
 	line, err := reader.ReadString('\n')
@@ -601,6 +624,11 @@ func handleClient(conn net.Conn) {
 				storeMutex.Unlock()
 
 				conn.Write([]byte("+OK\r\n"))
+
+				// Propagate to replicas if this is a master
+				if !isReplica {
+					propagateToReplicas(args)
+				}
 			}
 		case "GET":
 			if len(args) >= 2 {
@@ -1300,6 +1328,11 @@ func handleClient(conn net.Conn) {
 			rdbResponse := fmt.Sprintf("$%d\r\n", len(emptyRDB))
 			conn.Write([]byte(rdbResponse))
 			conn.Write(emptyRDB)
+
+			// Add this connection to the list of replicas
+			replicasMutex.Lock()
+			replicas = append(replicas, conn)
+			replicasMutex.Unlock()
 		case "MULTI":
 			transactionMutex.Lock()
 			transactionStates[conn] = true
