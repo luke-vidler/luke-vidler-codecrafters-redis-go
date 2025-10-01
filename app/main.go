@@ -1275,6 +1275,10 @@ func handleClient(conn net.Conn) {
 				// For now, only support replication section
 				conn.Write([]byte("-ERR unknown section or missing argument\r\n"))
 			}
+		case "REPLCONF":
+			// Handle REPLCONF command from replicas during handshake
+			// We can ignore the arguments and just respond with OK
+			conn.Write([]byte("+OK\r\n"))
 		case "MULTI":
 			transactionMutex.Lock()
 			transactionStates[conn] = true
