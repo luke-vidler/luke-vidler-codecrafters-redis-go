@@ -1485,14 +1485,87 @@ func main() {
 			}
 			fmt.Println("Sent PSYNC ? -1")
 
-			// Read PSYNC response
+			// Read PSYNC response (FULLRESYNC)
 			_, err = reader.ReadString('\n')
 			if err != nil {
 				fmt.Printf("Failed to read PSYNC response: %s\n", err.Error())
 				return
 			}
 
-			fmt.Println("Handshake completed successfully")
+			// Read RDB file
+			// Format is: $<length>\r\n<binary_contents>
+			rdbHeader, err := reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Failed to read RDB header: %s\n", err.Error())
+				return
+			}
+
+			// Parse the length from the header (format: $<length>\r\n)
+			rdbHeader = strings.TrimRight(rdbHeader, "\r\n")
+			if !strings.HasPrefix(rdbHeader, "$") {
+				fmt.Printf("Invalid RDB header format: %s\n", rdbHeader)
+				return
+			}
+
+			rdbLength, err := strconv.Atoi(rdbHeader[1:])
+			if err != nil {
+				fmt.Printf("Failed to parse RDB length: %s\n", err.Error())
+				return
+			}
+
+			// Read the RDB file contents
+			rdbContents := make([]byte, rdbLength)
+			_, err = reader.Read(rdbContents)
+			if err != nil {
+				fmt.Printf("Failed to read RDB contents: %s\n", err.Error())
+				return
+			}
+
+			fmt.Println("Handshake completed successfully, RDB file received")
+
+			// Now keep listening for commands from the master
+			for {
+				args, err := parseRESP(reader)
+				if err != nil {
+					fmt.Printf("Error parsing command from master: %s\n", err.Error())
+					break
+				}
+
+				if len(args) == 0 {
+					continue
+				}
+
+				// Process the command but don't send a response
+				command := strings.ToUpper(args[0])
+				switch command {
+				case "SET":
+					if len(args) >= 3 {
+						key := args[1]
+						value := args[2]
+						var expiry *time.Time
+
+						// Parse PX option
+						for i := 3; i < len(args)-1; i++ {
+							if strings.ToUpper(args[i]) == "PX" && i+1 < len(args) {
+								if expiryMs, err := strconv.Atoi(args[i+1]); err == nil {
+									expiryTime := time.Now().Add(time.Duration(expiryMs) * time.Millisecond)
+									expiry = &expiryTime
+								}
+								break
+							}
+						}
+
+						storeMutex.Lock()
+						store[key] = storeItem{value: value, expiry: expiry}
+						storeMutex.Unlock()
+
+						fmt.Printf("Replica processed SET %s %s\n", key, value)
+					}
+				// Add other write commands here as needed
+				default:
+					fmt.Printf("Replica received command: %s\n", command)
+				}
+			}
 		}()
 	}
 
