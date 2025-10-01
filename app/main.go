@@ -1357,6 +1357,29 @@ func main() {
 		}
 	}
 
+	// If running as replica, connect to master and perform handshake
+	if isReplica {
+		go func() {
+			masterAddr := net.JoinHostPort(masterHost, masterPort)
+			masterConn, err := net.Dial("tcp", masterAddr)
+			if err != nil {
+				fmt.Printf("Failed to connect to master at %s: %s\n", masterAddr, err.Error())
+				return
+			}
+			defer masterConn.Close()
+
+			// Send PING command as RESP array
+			pingCmd := "*1\r\n$4\r\nPING\r\n"
+			_, err = masterConn.Write([]byte(pingCmd))
+			if err != nil {
+				fmt.Printf("Failed to send PING to master: %s\n", err.Error())
+				return
+			}
+
+			fmt.Println("Sent PING to master")
+		}()
+	}
+
 	l, err := net.Listen("tcp", "0.0.0.0:"+port)
 	if err != nil {
 		fmt.Printf("Failed to bind to port %s\n", port)
