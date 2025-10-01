@@ -42,6 +42,13 @@ type blockedStreamClient struct {
 	resultCh   chan string // Channel to send result when unblocked
 }
 
+type replicaConnection struct {
+	conn      net.Conn
+	reader    *bufio.Reader
+	mutex     sync.Mutex // Mutex to synchronize access to the connection
+	isReplica bool       // Flag to indicate this is a replica connection
+}
+
 var (
 	store                = make(map[string]storeItem)
 	storeMutex           sync.RWMutex
@@ -56,16 +63,18 @@ var (
 	masterPort           = ""                                         // Master port if running as replica
 	masterReplid         = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb" // Hardcoded replication ID for master
 	masterReplOffset     = 0                                          // Replication offset for master
-	replicas             []net.Conn                                   // List of connected replicas
+	replicas             []*replicaConnection                         // List of connected replicas
 	replicasMutex        sync.RWMutex
 	replicaOffset        = 0 // Offset for replica - number of bytes of commands processed
 	replicaOffsetMutex   sync.Mutex
+	replicaConnections   = make(map[net.Conn]bool) // Track which connections are replicas
+	replicaConnMutex     sync.RWMutex
 )
 
-// propagateToReplicas sends a command to all connected replicas
-func propagateToReplicas(args []string) {
+// propagateToReplicas sends a command to all connected replicas and returns the number of bytes sent
+func propagateToReplicas(args []string) int {
 	if len(args) == 0 {
-		return
+		return 0
 	}
 
 	// Build RESP array for the command
@@ -79,8 +88,10 @@ func propagateToReplicas(args []string) {
 
 	// Send to all replicas
 	for _, replica := range replicas {
-		replica.Write([]byte(resp))
+		replica.conn.Write([]byte(resp))
 	}
+
+	return len(resp)
 }
 
 func parseRESP(reader *bufio.Reader) ([]string, error) {
@@ -611,7 +622,15 @@ func executeCommand(args []string, conn net.Conn) string {
 
 func handleClient(conn net.Conn) {
 	defer func() {
-		conn.Close()
+		// Only close if it's not a replica connection
+		replicaConnMutex.RLock()
+		isReplicaConn := replicaConnections[conn]
+		replicaConnMutex.RUnlock()
+
+		if !isReplicaConn {
+			conn.Close()
+		}
+
 		// Clean up transaction state when connection closes
 		transactionMutex.Lock()
 		delete(transactionStates, conn)
@@ -682,7 +701,9 @@ func handleClient(conn net.Conn) {
 
 				// Propagate to replicas if this is a master
 				if !isReplica {
-					propagateToReplicas(args)
+					bytesWritten := propagateToReplicas(args)
+					// Update master offset
+					masterReplOffset += bytesWritten
 				}
 			}
 		case "GET":
@@ -1384,20 +1405,141 @@ func handleClient(conn net.Conn) {
 			conn.Write([]byte(rdbResponse))
 			conn.Write(emptyRDB)
 
+			// Mark this connection as a replica
+			replicaConnMutex.Lock()
+			replicaConnections[conn] = true
+			replicaConnMutex.Unlock()
+
 			// Add this connection to the list of replicas
 			replicasMutex.Lock()
-			replicas = append(replicas, conn)
+			replicas = append(replicas, &replicaConnection{
+				conn:      conn,
+				reader:    reader,
+				isReplica: true,
+			})
 			replicasMutex.Unlock()
+
+			// Stop processing commands from this connection in handleClient
+			// The WAIT command will handle communication with this replica
+			return
 		case "WAIT":
 			// WAIT command: WAIT <numreplicas> <timeout>
-			// Return the number of connected replicas
+			if len(args) < 3 {
+				conn.Write([]byte("-ERR wrong number of arguments for 'wait' command\r\n"))
+				continue
+			}
+
+			expectedReplicas, err := strconv.Atoi(args[1])
+			if err != nil {
+				conn.Write([]byte("-ERR invalid numreplicas\r\n"))
+				continue
+			}
+
+			timeoutMs, err := strconv.Atoi(args[2])
+			if err != nil {
+				conn.Write([]byte("-ERR invalid timeout\r\n"))
+				continue
+			}
+
 			replicasMutex.RLock()
 			numReplicas := len(replicas)
 			replicasMutex.RUnlock()
 
-			// Return the count of connected replicas as RESP integer
-			response := fmt.Sprintf(":%d\r\n", numReplicas)
-			conn.Write([]byte(response))
+			// If no replicas, return 0 immediately
+			if numReplicas == 0 {
+				conn.Write([]byte(":0\r\n"))
+				continue
+			}
+
+			// If no writes have been made (offset is 0), all replicas are in sync
+			if masterReplOffset == 0 {
+				response := fmt.Sprintf(":%d\r\n", numReplicas)
+				conn.Write([]byte(response))
+				continue
+			}
+
+			// Send REPLCONF GETACK to all replicas
+			getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
+
+			// Create channels to receive ACK responses
+			type ackResponse struct {
+				offset int
+				err    error
+			}
+			ackChan := make(chan ackResponse, numReplicas)
+
+			replicasMutex.RLock()
+			for _, replica := range replicas {
+				go func(r *replicaConnection) {
+					// Lock the replica connection for exclusive access
+					r.mutex.Lock()
+					defer r.mutex.Unlock()
+
+					// Send GETACK command
+					_, err := r.conn.Write([]byte(getackCmd))
+					if err != nil {
+						ackChan <- ackResponse{err: err}
+						return
+					}
+
+					// Set read deadline to prevent blocking forever
+					r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs+100) * time.Millisecond))
+					defer r.conn.SetReadDeadline(time.Time{}) // Clear deadline
+
+					// Read the response using the stored reader
+					ackArgs, _, err := parseRESPWithBytes(r.reader)
+					if err != nil {
+						ackChan <- ackResponse{err: err}
+						return
+					}
+
+					// Parse the offset from REPLCONF ACK <offset>
+					if len(ackArgs) >= 3 && strings.ToUpper(ackArgs[0]) == "REPLCONF" && strings.ToUpper(ackArgs[1]) == "ACK" {
+						offset, err := strconv.Atoi(ackArgs[2])
+						if err != nil {
+							ackChan <- ackResponse{err: err}
+							return
+						}
+						ackChan <- ackResponse{offset: offset}
+					} else {
+						ackChan <- ackResponse{err: fmt.Errorf("unexpected response format")}
+					}
+				}(replica)
+			}
+			replicasMutex.RUnlock()
+
+			// Wait for responses or timeout
+			timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
+			ackedCount := 0
+			responsesReceived := 0
+
+		waitLoop:
+			for responsesReceived < numReplicas {
+				select {
+				case ack := <-ackChan:
+					responsesReceived++
+					if ack.err == nil && ack.offset >= masterReplOffset {
+						ackedCount++
+						// Check if we've reached the expected number of replicas
+						if ackedCount >= expectedReplicas {
+							response := fmt.Sprintf(":%d\r\n", ackedCount)
+							conn.Write([]byte(response))
+							break waitLoop
+						}
+					}
+				case <-timeout:
+					// Timeout expired, return the count of replicas that have acknowledged
+					response := fmt.Sprintf(":%d\r\n", ackedCount)
+					conn.Write([]byte(response))
+					break waitLoop
+				}
+			}
+
+			// All replicas responded (only reached if loop completes normally)
+			if responsesReceived >= numReplicas {
+				response := fmt.Sprintf(":%d\r\n", ackedCount)
+				conn.Write([]byte(response))
+			}
 		case "MULTI":
 			transactionMutex.Lock()
 			transactionStates[conn] = true
