@@ -1368,15 +1368,57 @@ func main() {
 			}
 			defer masterConn.Close()
 
-			// Send PING command as RESP array
+			reader := bufio.NewReader(masterConn)
+
+			// Step 1: Send PING command as RESP array
 			pingCmd := "*1\r\n$4\r\nPING\r\n"
 			_, err = masterConn.Write([]byte(pingCmd))
 			if err != nil {
 				fmt.Printf("Failed to send PING to master: %s\n", err.Error())
 				return
 			}
-
 			fmt.Println("Sent PING to master")
+
+			// Read PING response
+			_, err = reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Failed to read PING response: %s\n", err.Error())
+				return
+			}
+
+			// Step 2: Send REPLCONF listening-port <PORT>
+			replconfPort := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%s\r\n", len(port), port)
+			_, err = masterConn.Write([]byte(replconfPort))
+			if err != nil {
+				fmt.Printf("Failed to send REPLCONF listening-port: %s\n", err.Error())
+				return
+			}
+			fmt.Println("Sent REPLCONF listening-port")
+
+			// Read REPLCONF response
+			_, err = reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Failed to read REPLCONF listening-port response: %s\n", err.Error())
+				return
+			}
+
+			// Step 3: Send REPLCONF capa psync2
+			replconfCapa := "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
+			_, err = masterConn.Write([]byte(replconfCapa))
+			if err != nil {
+				fmt.Printf("Failed to send REPLCONF capa: %s\n", err.Error())
+				return
+			}
+			fmt.Println("Sent REPLCONF capa psync2")
+
+			// Read REPLCONF response
+			_, err = reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Failed to read REPLCONF capa response: %s\n", err.Error())
+				return
+			}
+
+			fmt.Println("Handshake completed successfully")
 		}()
 	}
 
