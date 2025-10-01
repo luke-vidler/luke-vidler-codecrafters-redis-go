@@ -1388,6 +1388,20 @@ func handleClient(conn net.Conn) {
 			replicasMutex.Lock()
 			replicas = append(replicas, conn)
 			replicasMutex.Unlock()
+		case "WAIT":
+			// WAIT command: WAIT <numreplicas> <timeout>
+			// For now, return 0 if no replicas are connected
+			replicasMutex.RLock()
+			numReplicas := len(replicas)
+			replicasMutex.RUnlock()
+
+			if numReplicas == 0 {
+				// No replicas connected, return 0 immediately
+				conn.Write([]byte(":0\r\n"))
+			} else {
+				// TODO: Implement proper WAIT logic in future stages
+				conn.Write([]byte(":0\r\n"))
+			}
 		case "MULTI":
 			transactionMutex.Lock()
 			transactionStates[conn] = true
