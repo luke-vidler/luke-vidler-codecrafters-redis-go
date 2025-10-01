@@ -1279,6 +1279,11 @@ func handleClient(conn net.Conn) {
 			// Handle REPLCONF command from replicas during handshake
 			// We can ignore the arguments and just respond with OK
 			conn.Write([]byte("+OK\r\n"))
+		case "PSYNC":
+			// Handle PSYNC command from replicas during handshake
+			// Respond with FULLRESYNC <REPL_ID> <OFFSET>
+			response := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplid, masterReplOffset)
+			conn.Write([]byte(response))
 		case "MULTI":
 			transactionMutex.Lock()
 			transactionStates[conn] = true
