@@ -664,6 +664,30 @@ func handleClient(conn net.Conn) {
 
 		command := strings.ToUpper(args[0])
 
+		// Check if client is in subscribed mode
+		subscriptionsMutex.RLock()
+		inSubscribedMode := len(clientSubscriptions[conn]) > 0
+		subscriptionsMutex.RUnlock()
+
+		// In subscribed mode, only allow specific commands
+		if inSubscribedMode {
+			allowedInSubscribedMode := map[string]bool{
+				"SUBSCRIBE":    true,
+				"UNSUBSCRIBE":  true,
+				"PSUBSCRIBE":   true,
+				"PUNSUBSCRIBE": true,
+				"PING":         true,
+				"QUIT":         true,
+				"RESET":        true,
+			}
+
+			if !allowedInSubscribedMode[command] {
+				errorMsg := fmt.Sprintf("-ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n", strings.ToLower(command))
+				conn.Write([]byte(errorMsg))
+				continue
+			}
+		}
+
 		// Check if we're in a transaction and should queue commands
 		transactionMutex.RLock()
 		inTransaction := transactionStates[conn]
