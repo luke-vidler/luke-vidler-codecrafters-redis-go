@@ -69,6 +69,8 @@ var (
 	replicaOffsetMutex   sync.Mutex
 	replicaConnections   = make(map[net.Conn]bool) // Track which connections are replicas
 	replicaConnMutex     sync.RWMutex
+	configDir            = "" // RDB file directory
+	configDbFilename     = "" // RDB file name
 )
 
 // propagateToReplicas sends a command to all connected replicas and returns the number of bytes sent
@@ -1596,6 +1598,28 @@ func handleClient(conn net.Conn) {
 
 				conn.Write([]byte("+OK\r\n"))
 			}
+		case "CONFIG":
+			if len(args) >= 3 && strings.ToUpper(args[1]) == "GET" {
+				paramName := strings.ToLower(args[2])
+				var paramValue string
+
+				switch paramName {
+				case "dir":
+					paramValue = configDir
+				case "dbfilename":
+					paramValue = configDbFilename
+				default:
+					conn.Write([]byte("-ERR unknown config parameter\r\n"))
+					continue
+				}
+
+				// Return array with [parameter_name, parameter_value]
+				response := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+					len(paramName), paramName, len(paramValue), paramValue)
+				conn.Write([]byte(response))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'config' command\r\n"))
+			}
 		}
 	}
 }
@@ -1619,6 +1643,10 @@ func main() {
 				masterHost = parts[0]
 				masterPort = parts[1]
 			}
+		} else if arg == "--dir" && i+1 < len(os.Args) {
+			configDir = os.Args[i+1]
+		} else if arg == "--dbfilename" && i+1 < len(os.Args) {
+			configDbFilename = os.Args[i+1]
 		}
 	}
 
