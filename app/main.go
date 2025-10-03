@@ -72,8 +72,10 @@ var (
 	replicaOffsetMutex   sync.Mutex
 	replicaConnections   = make(map[net.Conn]bool) // Track which connections are replicas
 	replicaConnMutex     sync.RWMutex
-	configDir            = "" // RDB file directory
-	configDbFilename     = "" // RDB file name
+	configDir            = ""                          // RDB file directory
+	configDbFilename     = ""                          // RDB file name
+	clientSubscriptions  = make(map[net.Conn][]string) // conn -> list of subscribed channels
+	subscriptionsMutex   sync.RWMutex
 )
 
 // propagateToReplicas sends a command to all connected replicas and returns the number of bytes sent
@@ -641,6 +643,11 @@ func handleClient(conn net.Conn) {
 		delete(transactionStates, conn)
 		delete(transactionQueues, conn)
 		transactionMutex.Unlock()
+
+		// Clean up subscription state when connection closes
+		subscriptionsMutex.Lock()
+		delete(clientSubscriptions, conn)
+		subscriptionsMutex.Unlock()
 	}()
 	reader := bufio.NewReader(conn)
 
@@ -1648,6 +1655,26 @@ func handleClient(conn net.Conn) {
 				}
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'keys' command\r\n"))
+			}
+		case "SUBSCRIBE":
+			if len(args) >= 2 {
+				channelName := args[1]
+
+				subscriptionsMutex.Lock()
+				// Add channel to this client's subscription list
+				if clientSubscriptions[conn] == nil {
+					clientSubscriptions[conn] = make([]string, 0)
+				}
+				clientSubscriptions[conn] = append(clientSubscriptions[conn], channelName)
+				numSubscriptions := len(clientSubscriptions[conn])
+				subscriptionsMutex.Unlock()
+
+				// Build response: ["subscribe", channel_name, num_subscriptions]
+				response := fmt.Sprintf("*3\r\n$9\r\nsubscribe\r\n$%d\r\n%s\r\n:%d\r\n",
+					len(channelName), channelName, numSubscriptions)
+				conn.Write([]byte(response))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'subscribe' command\r\n"))
 			}
 		}
 	}
