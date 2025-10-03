@@ -75,6 +75,7 @@ var (
 	configDir            = ""                          // RDB file directory
 	configDbFilename     = ""                          // RDB file name
 	clientSubscriptions  = make(map[net.Conn][]string) // conn -> list of subscribed channels
+	channelSubscribers   = make(map[string][]net.Conn) // channel -> list of subscriber connections
 	subscriptionsMutex   sync.RWMutex
 )
 
@@ -646,6 +647,24 @@ func handleClient(conn net.Conn) {
 
 		// Clean up subscription state when connection closes
 		subscriptionsMutex.Lock()
+		// Remove client from all channel subscriber lists
+		if channels, exists := clientSubscriptions[conn]; exists {
+			for _, channel := range channels {
+				if subscribers, ok := channelSubscribers[channel]; ok {
+					// Remove this connection from the channel's subscriber list
+					for i, sub := range subscribers {
+						if sub == conn {
+							channelSubscribers[channel] = append(subscribers[:i], subscribers[i+1:]...)
+							break
+						}
+					}
+					// Remove channel entry if no more subscribers
+					if len(channelSubscribers[channel]) == 0 {
+						delete(channelSubscribers, channel)
+					}
+				}
+			}
+		}
 		delete(clientSubscriptions, conn)
 		subscriptionsMutex.Unlock()
 	}()
@@ -1699,6 +1718,12 @@ func handleClient(conn net.Conn) {
 				}
 				clientSubscriptions[conn] = append(clientSubscriptions[conn], channelName)
 				numSubscriptions := len(clientSubscriptions[conn])
+
+				// Add client to the channel's subscriber list
+				if channelSubscribers[channelName] == nil {
+					channelSubscribers[channelName] = make([]net.Conn, 0)
+				}
+				channelSubscribers[channelName] = append(channelSubscribers[channelName], conn)
 				subscriptionsMutex.Unlock()
 
 				// Build response: ["subscribe", channel_name, num_subscriptions]
@@ -1707,6 +1732,21 @@ func handleClient(conn net.Conn) {
 				conn.Write([]byte(response))
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'subscribe' command\r\n"))
+			}
+		case "PUBLISH":
+			if len(args) >= 3 {
+				channelName := args[1]
+				// message := args[2] // Message content (not used in this stage)
+
+				subscriptionsMutex.RLock()
+				numSubscribers := len(channelSubscribers[channelName])
+				subscriptionsMutex.RUnlock()
+
+				// Return the number of subscribers as RESP integer
+				response := fmt.Sprintf(":%d\r\n", numSubscribers)
+				conn.Write([]byte(response))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'publish' command\r\n"))
 			}
 		}
 	}
