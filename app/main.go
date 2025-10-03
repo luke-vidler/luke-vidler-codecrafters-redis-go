@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1620,8 +1623,250 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'config' command\r\n"))
 			}
+		case "KEYS":
+			if len(args) >= 2 {
+				pattern := args[1]
+
+				// Only support "*" pattern for now
+				if pattern == "*" {
+					storeMutex.RLock()
+					keys := make([]string, 0, len(store))
+					for key := range store {
+						keys = append(keys, key)
+					}
+					storeMutex.RUnlock()
+
+					// Build RESP array response
+					response := fmt.Sprintf("*%d\r\n", len(keys))
+					for _, key := range keys {
+						response += fmt.Sprintf("$%d\r\n%s\r\n", len(key), key)
+					}
+					conn.Write([]byte(response))
+				} else {
+					// Pattern not supported
+					conn.Write([]byte("*0\r\n"))
+				}
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'keys' command\r\n"))
+			}
 		}
 	}
+}
+
+// loadRDB loads an RDB file and populates the store
+func loadRDB(filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		// File doesn't exist or can't be opened - treat as empty database
+		return nil
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+
+	// Read and verify magic string "REDIS"
+	magic := make([]byte, 5)
+	if _, err := io.ReadFull(reader, magic); err != nil {
+		return fmt.Errorf("failed to read magic string: %w", err)
+	}
+	if string(magic) != "REDIS" {
+		return fmt.Errorf("invalid RDB file: wrong magic string")
+	}
+
+	// Read version (4 bytes)
+	version := make([]byte, 4)
+	if _, err := io.ReadFull(reader, version); err != nil {
+		return fmt.Errorf("failed to read version: %w", err)
+	}
+
+	// Parse the RDB file
+	for {
+		opcode, err := reader.ReadByte()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read opcode: %w", err)
+		}
+
+		switch opcode {
+		case 0xFF: // EOF
+			// End of RDB file
+			return nil
+		case 0xFE: // SELECTDB
+			// Read database number (length-encoded)
+			_, err := readLength(reader)
+			if err != nil {
+				return fmt.Errorf("failed to read database number: %w", err)
+			}
+			// We only support database 0, so just continue
+		case 0xFB: // RESIZEDB
+			// Read hash table size and expiry table size
+			_, err := readLength(reader)
+			if err != nil {
+				return fmt.Errorf("failed to read hash table size: %w", err)
+			}
+			_, err = readLength(reader)
+			if err != nil {
+				return fmt.Errorf("failed to read expiry table size: %w", err)
+			}
+		case 0xFD: // EXPIRETIME (seconds)
+			// Read 4-byte expiry timestamp
+			expiryBytes := make([]byte, 4)
+			if _, err := io.ReadFull(reader, expiryBytes); err != nil {
+				return fmt.Errorf("failed to read expiry time: %w", err)
+			}
+			expiryTimestamp := binary.LittleEndian.Uint32(expiryBytes)
+			expiryTime := time.Unix(int64(expiryTimestamp), 0)
+
+			// Read the value type and key-value pair
+			if err := readKeyValuePair(reader, &expiryTime); err != nil {
+				return fmt.Errorf("failed to read key-value pair with expiry: %w", err)
+			}
+		case 0xFC: // EXPIRETIME_MS (milliseconds)
+			// Read 8-byte expiry timestamp in milliseconds
+			expiryBytes := make([]byte, 8)
+			if _, err := io.ReadFull(reader, expiryBytes); err != nil {
+				return fmt.Errorf("failed to read expiry time (ms): %w", err)
+			}
+			expiryTimestamp := binary.LittleEndian.Uint64(expiryBytes)
+			expiryTime := time.UnixMilli(int64(expiryTimestamp))
+
+			// Read the value type and key-value pair
+			if err := readKeyValuePair(reader, &expiryTime); err != nil {
+				return fmt.Errorf("failed to read key-value pair with expiry (ms): %w", err)
+			}
+		case 0xFA: // AUX field
+			// Read auxiliary field (key-value metadata)
+			_, err := readString(reader)
+			if err != nil {
+				return fmt.Errorf("failed to read aux key: %w", err)
+			}
+			_, err = readString(reader)
+			if err != nil {
+				return fmt.Errorf("failed to read aux value: %w", err)
+			}
+		default:
+			// This is a value type byte, read key-value pair
+			if err := readKeyValuePairWithType(reader, opcode, nil); err != nil {
+				return fmt.Errorf("failed to read key-value pair: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// readLength reads a length-encoded integer
+func readLength(reader *bufio.Reader) (uint64, error) {
+	firstByte, err := reader.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+
+	// Check the first 2 bits
+	typeVal := (firstByte & 0xC0) >> 6
+
+	switch typeVal {
+	case 0: // 6-bit length
+		return uint64(firstByte & 0x3F), nil
+	case 1: // 14-bit length
+		secondByte, err := reader.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		return uint64((firstByte&0x3F))<<8 | uint64(secondByte), nil
+	case 2: // 32-bit length (big-endian)
+		lengthBytes := make([]byte, 4)
+		if _, err := io.ReadFull(reader, lengthBytes); err != nil {
+			return 0, err
+		}
+		return uint64(binary.BigEndian.Uint32(lengthBytes)), nil
+	case 3: // Special encoding
+		// Return a special marker (we'll handle this in readString)
+		return uint64(firstByte&0x3F) | 0x8000000000000000, nil
+	}
+
+	return 0, fmt.Errorf("invalid length encoding")
+}
+
+// readString reads a length-prefixed string
+func readString(reader *bufio.Reader) (string, error) {
+	length, err := readLength(reader)
+	if err != nil {
+		return "", err
+	}
+
+	// Check if this is a special encoding
+	if length&0x8000000000000000 != 0 {
+		// Special encoding
+		encodingType := length & 0x3F
+		switch encodingType {
+		case 0: // 8-bit integer
+			b, err := reader.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%d", int8(b)), nil
+		case 1: // 16-bit integer (little-endian)
+			intBytes := make([]byte, 2)
+			if _, err := io.ReadFull(reader, intBytes); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%d", int16(binary.LittleEndian.Uint16(intBytes))), nil
+		case 2: // 32-bit integer (little-endian)
+			intBytes := make([]byte, 4)
+			if _, err := io.ReadFull(reader, intBytes); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%d", int32(binary.LittleEndian.Uint32(intBytes))), nil
+		default:
+			return "", fmt.Errorf("unsupported special encoding type: %d", encodingType)
+		}
+	}
+
+	strBytes := make([]byte, length)
+	if _, err := io.ReadFull(reader, strBytes); err != nil {
+		return "", err
+	}
+
+	return string(strBytes), nil
+}
+
+// readKeyValuePair reads a key-value pair (reads value type first)
+func readKeyValuePair(reader *bufio.Reader, expiry *time.Time) error {
+	valueType, err := reader.ReadByte()
+	if err != nil {
+		return err
+	}
+	return readKeyValuePairWithType(reader, valueType, expiry)
+}
+
+// readKeyValuePairWithType reads a key-value pair with a given value type
+func readKeyValuePairWithType(reader *bufio.Reader, valueType byte, expiry *time.Time) error {
+	// Read the key
+	key, err := readString(reader)
+	if err != nil {
+		return fmt.Errorf("failed to read key: %w", err)
+	}
+
+	// Read the value based on type
+	switch valueType {
+	case 0: // String encoding
+		value, err := readString(reader)
+		if err != nil {
+			return fmt.Errorf("failed to read string value: %w", err)
+		}
+
+		storeMutex.Lock()
+		store[key] = storeItem{value: value, expiry: expiry}
+		storeMutex.Unlock()
+	default:
+		// Other types not supported yet
+		return fmt.Errorf("unsupported value type: %d", valueType)
+	}
+
+	return nil
 }
 
 func main() {
@@ -1647,6 +1892,16 @@ func main() {
 			configDir = os.Args[i+1]
 		} else if arg == "--dbfilename" && i+1 < len(os.Args) {
 			configDbFilename = os.Args[i+1]
+		}
+	}
+
+	// Load RDB file if dir and dbfilename are specified
+	if configDir != "" && configDbFilename != "" {
+		rdbPath := filepath.Join(configDir, configDbFilename)
+		if err := loadRDB(rdbPath); err != nil {
+			fmt.Printf("Error loading RDB file: %s\n", err.Error())
+		} else {
+			fmt.Printf("Loaded RDB file from %s\n", rdbPath)
 		}
 	}
 
