@@ -1736,11 +1736,23 @@ func handleClient(conn net.Conn) {
 		case "PUBLISH":
 			if len(args) >= 3 {
 				channelName := args[1]
-				// message := args[2] // Message content (not used in this stage)
+				message := args[2]
 
 				subscriptionsMutex.RLock()
-				numSubscribers := len(channelSubscribers[channelName])
+				// Get a copy of the subscribers list
+				subscribers := make([]net.Conn, len(channelSubscribers[channelName]))
+				copy(subscribers, channelSubscribers[channelName])
+				numSubscribers := len(subscribers)
 				subscriptionsMutex.RUnlock()
+
+				// Deliver message to all subscribers
+				// Build message array: ["message", channel_name, message_content]
+				messageResponse := fmt.Sprintf("*3\r\n$7\r\nmessage\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+					len(channelName), channelName, len(message), message)
+
+				for _, subscriber := range subscribers {
+					subscriber.Write([]byte(messageResponse))
+				}
 
 				// Return the number of subscribers as RESP integer
 				response := fmt.Sprintf(":%d\r\n", numSubscribers)
