@@ -1760,6 +1760,49 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'publish' command\r\n"))
 			}
+		case "UNSUBSCRIBE":
+			if len(args) >= 2 {
+				channelName := args[1]
+
+				subscriptionsMutex.Lock()
+
+				// Remove channel from client's subscription list
+				if channels, exists := clientSubscriptions[conn]; exists {
+					for i, ch := range channels {
+						if ch == channelName {
+							// Remove this channel from the list
+							clientSubscriptions[conn] = append(channels[:i], channels[i+1:]...)
+							break
+						}
+					}
+				}
+
+				// Remove client from channel's subscriber list
+				if subscribers, exists := channelSubscribers[channelName]; exists {
+					for i, sub := range subscribers {
+						if sub == conn {
+							// Remove this connection from the channel's subscriber list
+							channelSubscribers[channelName] = append(subscribers[:i], subscribers[i+1:]...)
+							break
+						}
+					}
+					// Remove channel entry if no more subscribers
+					if len(channelSubscribers[channelName]) == 0 {
+						delete(channelSubscribers, channelName)
+					}
+				}
+
+				// Get remaining subscription count for this client
+				numSubscriptions := len(clientSubscriptions[conn])
+				subscriptionsMutex.Unlock()
+
+				// Build response: ["unsubscribe", channel_name, num_subscriptions]
+				response := fmt.Sprintf("*3\r\n$11\r\nunsubscribe\r\n$%d\r\n%s\r\n:%d\r\n",
+					len(channelName), channelName, numSubscriptions)
+				conn.Write([]byte(response))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'unsubscribe' command\r\n"))
+			}
 		}
 	}
 }
