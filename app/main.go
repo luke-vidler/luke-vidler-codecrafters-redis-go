@@ -704,7 +704,15 @@ func handleClient(conn net.Conn) {
 
 		switch command {
 		case "PING":
-			conn.Write([]byte("+PONG\r\n"))
+			// Check if client is in subscribed mode
+			if inSubscribedMode {
+				// In subscribed mode, respond with ["pong", ""] as RESP array
+				response := "*2\r\n$4\r\npong\r\n$0\r\n\r\n"
+				conn.Write([]byte(response))
+			} else {
+				// Normal mode: respond with +PONG
+				conn.Write([]byte("+PONG\r\n"))
+			}
 		case "ECHO":
 			if len(args) >= 2 {
 				arg := args[1]
