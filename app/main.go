@@ -2112,6 +2112,10 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'zrem' command\r\n"))
 			}
+		case "GEOADD":
+			// For now, just return 1 (number of locations added)
+			// We'll validate arguments and store locations in later stages
+			conn.Write([]byte(":1\r\n"))
 		}
 	}
 }
