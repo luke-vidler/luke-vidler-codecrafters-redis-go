@@ -1945,13 +1945,31 @@ func handleClient(conn net.Conn) {
 
 				setLen := len(item.sortedSet)
 
+				// Handle negative indexes
+				// -1 refers to last element, -2 to second last, etc.
+				if start < 0 {
+					start = setLen + start
+					// If still negative (out of range), treat as 0
+					if start < 0 {
+						start = 0
+					}
+				}
+
+				if stop < 0 {
+					stop = setLen + stop
+					// If still negative (out of range), treat as 0
+					if stop < 0 {
+						stop = 0
+					}
+				}
+
 				// If start >= setLen, return empty array
 				if start >= setLen {
 					conn.Write([]byte("*0\r\n"))
 					continue
 				}
 
-				// If stop > setLen, treat stop as last element
+				// If stop >= setLen, treat stop as last element
 				if stop >= setLen {
 					stop = setLen - 1
 				}
