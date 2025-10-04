@@ -2143,8 +2143,9 @@ func handleClient(conn net.Conn) {
 				}
 
 				// Store location in sorted set
-				// For now, hardcode score to 0 (will calculate from lat/lon in later stages)
-				score := 0.0
+				// Calculate geohash score from latitude and longitude
+				geohash := geohashEncode(longitude, latitude)
+				score := float64(geohash)
 
 				storeMutex.Lock()
 				item, exists := store[key]
@@ -2219,6 +2220,43 @@ func handleClient(conn net.Conn) {
 			}
 		}
 	}
+}
+
+// geohashEncode converts latitude and longitude to a 52-bit geohash integer
+// using binary search interval division (geohash algorithm)
+func geohashEncode(longitude float64, latitude float64) uint64 {
+	var score uint64 = 0
+
+	// WGS84 ranges - Web Mercator projection limits
+	lonMin, lonMax := -180.0, 180.0
+	latMin, latMax := -85.05112878, 85.05112878
+
+	// Encode 52 bits by alternating between longitude and latitude
+	// Even bits (0, 2, 4, ...) = longitude
+	// Odd bits (1, 3, 5, ...) = latitude
+	for i := 0; i < 52; i++ {
+		if i%2 == 0 { // longitude bit
+			xmid := (lonMin + lonMax) / 2
+			if longitude < xmid {
+				score = score << 1 // left half = 0
+				lonMax = xmid
+			} else {
+				score = score<<1 | 1 // right half = 1
+				lonMin = xmid
+			}
+		} else { // latitude bit
+			ymid := (latMin + latMax) / 2
+			if latitude < ymid {
+				score = score << 1 // bottom half = 0
+				latMax = ymid
+			} else {
+				score = score<<1 | 1 // top half = 1
+				latMin = ymid
+			}
+		}
+	}
+
+	return score
 }
 
 // loadRDB loads an RDB file and populates the store
