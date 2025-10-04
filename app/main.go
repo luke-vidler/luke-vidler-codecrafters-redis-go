@@ -1825,12 +1825,14 @@ func handleClient(conn net.Conn) {
 				storeMutex.Lock()
 				item, exists := store[key]
 
-				// Check if member already exists
+				// Check if member already exists and find its index
 				memberExists := false
+				memberIndex := -1
 				if exists {
-					for _, m := range item.sortedSet {
+					for i, m := range item.sortedSet {
 						if m.member == member {
 							memberExists = true
+							memberIndex = i
 							break
 						}
 					}
@@ -1841,29 +1843,51 @@ func handleClient(conn net.Conn) {
 					store[key] = storeItem{
 						sortedSet: []sortedSetMember{{member: member, score: score}},
 					}
-				} else {
-					// Add member to existing sorted set if it doesn't exist
-					if !memberExists {
-						// Insert member in sorted position
-						newMember := sortedSetMember{member: member, score: score}
-						inserted := false
+				} else if memberExists {
+					// Update existing member's score - remove old, insert new
+					// Remove the old member
+					item.sortedSet = append(item.sortedSet[:memberIndex], item.sortedSet[memberIndex+1:]...)
 
-						for i, m := range item.sortedSet {
-							if score < m.score || (score == m.score && member < m.member) {
-								// Insert before this position
-								item.sortedSet = append(item.sortedSet[:i], append([]sortedSetMember{newMember}, item.sortedSet[i:]...)...)
-								inserted = true
-								break
-							}
+					// Insert member with new score in sorted position
+					newMember := sortedSetMember{member: member, score: score}
+					inserted := false
+
+					for i, m := range item.sortedSet {
+						if score < m.score || (score == m.score && member < m.member) {
+							// Insert before this position
+							item.sortedSet = append(item.sortedSet[:i], append([]sortedSetMember{newMember}, item.sortedSet[i:]...)...)
+							inserted = true
+							break
 						}
-
-						if !inserted {
-							// Append at the end
-							item.sortedSet = append(item.sortedSet, newMember)
-						}
-
-						store[key] = item
 					}
+
+					if !inserted {
+						// Append at the end
+						item.sortedSet = append(item.sortedSet, newMember)
+					}
+
+					store[key] = item
+				} else {
+					// Add new member to existing sorted set
+					// Insert member in sorted position
+					newMember := sortedSetMember{member: member, score: score}
+					inserted := false
+
+					for i, m := range item.sortedSet {
+						if score < m.score || (score == m.score && member < m.member) {
+							// Insert before this position
+							item.sortedSet = append(item.sortedSet[:i], append([]sortedSetMember{newMember}, item.sortedSet[i:]...)...)
+							inserted = true
+							break
+						}
+					}
+
+					if !inserted {
+						// Append at the end
+						item.sortedSet = append(item.sortedSet, newMember)
+					}
+
+					store[key] = item
 				}
 
 				storeMutex.Unlock()
@@ -2012,6 +2036,45 @@ func handleClient(conn net.Conn) {
 				conn.Write([]byte(response))
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'zcard' command\r\n"))
+			}
+		case "ZSCORE":
+			if len(args) >= 3 {
+				key := args[1]
+				member := args[2]
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				// Check if sorted set exists
+				if !exists || len(item.sortedSet) == 0 {
+					// Key doesn't exist or is not a sorted set
+					conn.Write([]byte("$-1\r\n"))
+					continue
+				}
+
+				// Find the member's score
+				found := false
+				var score float64
+				for _, m := range item.sortedSet {
+					if m.member == member {
+						score = m.score
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					// Member not found
+					conn.Write([]byte("$-1\r\n"))
+				} else {
+					// Return the score as RESP bulk string
+					scoreStr := strconv.FormatFloat(score, 'f', -1, 64)
+					response := fmt.Sprintf("$%d\r\n%s\r\n", len(scoreStr), scoreStr)
+					conn.Write([]byte(response))
+				}
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'zscore' command\r\n"))
 			}
 		}
 	}
