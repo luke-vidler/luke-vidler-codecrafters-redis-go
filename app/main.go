@@ -1878,6 +1878,42 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'zadd' command\r\n"))
 			}
+		case "ZRANK":
+			if len(args) >= 3 {
+				key := args[1]
+				member := args[2]
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				// Check if sorted set exists
+				if !exists || len(item.sortedSet) == 0 {
+					// Key doesn't exist or is not a sorted set
+					conn.Write([]byte("$-1\r\n"))
+					continue
+				}
+
+				// Find the member's rank (index) in the sorted set
+				rank := -1
+				for i, m := range item.sortedSet {
+					if m.member == member {
+						rank = i
+						break
+					}
+				}
+
+				if rank == -1 {
+					// Member not found
+					conn.Write([]byte("$-1\r\n"))
+				} else {
+					// Return the rank as RESP integer
+					response := fmt.Sprintf(":%d\r\n", rank)
+					conn.Write([]byte(response))
+				}
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'zrank' command\r\n"))
+			}
 		}
 	}
 }
