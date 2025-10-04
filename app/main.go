@@ -2218,6 +2218,47 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'geoadd' command\r\n"))
 			}
+		case "GEOPOS":
+			if len(args) >= 2 {
+				key := args[1]
+				members := args[2:]
+
+				storeMutex.RLock()
+				item, keyExists := store[key]
+				storeMutex.RUnlock()
+
+				// Build response array
+				var response strings.Builder
+				response.WriteString(fmt.Sprintf("*%d\r\n", len(members)))
+
+				for _, member := range members {
+					// Check if member exists in the sorted set
+					memberExists := false
+					if keyExists {
+						for _, m := range item.sortedSet {
+							if m.member == member {
+								memberExists = true
+								break
+							}
+						}
+					}
+
+					if memberExists {
+						// Return array with [lon, lat] - for now hardcoded to "0"
+						// We'll decode from geohash in later stages
+						lon := "0"
+						lat := "0"
+						response.WriteString(fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(lon), lon, len(lat), lat))
+					} else {
+						// Return null array for non-existent member
+						response.WriteString("*-1\r\n")
+					}
+				}
+
+				conn.Write([]byte(response.String()))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'geopos' command\r\n"))
+			}
 		}
 	}
 }
