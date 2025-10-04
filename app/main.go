@@ -2142,11 +2142,78 @@ func handleClient(conn net.Conn) {
 					continue
 				}
 
-				// For now, just return 1 (number of locations added)
-				// We'll store locations in later stages
-				_ = key
-				_ = member
-				conn.Write([]byte(":1\r\n"))
+				// Store location in sorted set
+				// For now, hardcode score to 0 (will calculate from lat/lon in later stages)
+				score := 0.0
+
+				storeMutex.Lock()
+				item, exists := store[key]
+
+				// Check if member already exists
+				memberExists := false
+				memberIndex := -1
+				if exists {
+					for i, m := range item.sortedSet {
+						if m.member == member {
+							memberExists = true
+							memberIndex = i
+							break
+						}
+					}
+				}
+
+				added := 0
+				if !exists {
+					// Create new sorted set with this member
+					store[key] = storeItem{
+						sortedSet: []sortedSetMember{{member: member, score: score}},
+					}
+					added = 1
+				} else if memberExists {
+					// Update existing member's score
+					item.sortedSet = append(item.sortedSet[:memberIndex], item.sortedSet[memberIndex+1:]...)
+
+					// Insert member with new score in sorted position
+					newMember := sortedSetMember{member: member, score: score}
+					inserted := false
+
+					for i, m := range item.sortedSet {
+						if score < m.score || (score == m.score && member < m.member) {
+							item.sortedSet = append(item.sortedSet[:i], append([]sortedSetMember{newMember}, item.sortedSet[i:]...)...)
+							inserted = true
+							break
+						}
+					}
+
+					if !inserted {
+						item.sortedSet = append(item.sortedSet, newMember)
+					}
+					store[key] = item
+					added = 0
+				} else {
+					// Add new member to existing sorted set
+					newMember := sortedSetMember{member: member, score: score}
+					inserted := false
+
+					for i, m := range item.sortedSet {
+						if score < m.score || (score == m.score && member < m.member) {
+							item.sortedSet = append(item.sortedSet[:i], append([]sortedSetMember{newMember}, item.sortedSet[i:]...)...)
+							inserted = true
+							break
+						}
+					}
+
+					if !inserted {
+						item.sortedSet = append(item.sortedSet, newMember)
+					}
+					store[key] = item
+					added = 1
+				}
+
+				storeMutex.Unlock()
+
+				response := fmt.Sprintf(":%d\r\n", added)
+				conn.Write([]byte(response))
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'geoadd' command\r\n"))
 			}
