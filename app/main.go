@@ -2113,9 +2113,43 @@ func handleClient(conn net.Conn) {
 				conn.Write([]byte("-ERR wrong number of arguments for 'zrem' command\r\n"))
 			}
 		case "GEOADD":
-			// For now, just return 1 (number of locations added)
-			// We'll validate arguments and store locations in later stages
-			conn.Write([]byte(":1\r\n"))
+			if len(args) >= 5 {
+				key := args[1]
+				longitudeStr := args[2]
+				latitudeStr := args[3]
+				member := args[4]
+
+				// Parse longitude and latitude
+				longitude, errLon := strconv.ParseFloat(longitudeStr, 64)
+				latitude, errLat := strconv.ParseFloat(latitudeStr, 64)
+
+				if errLon != nil || errLat != nil {
+					conn.Write([]byte("-ERR invalid longitude,latitude pair\r\n"))
+					continue
+				}
+
+				// Validate longitude: -180 to +180 (inclusive)
+				if longitude < -180 || longitude > 180 {
+					errorMsg := fmt.Sprintf("-ERR invalid longitude,latitude pair %f,%f\r\n", longitude, latitude)
+					conn.Write([]byte(errorMsg))
+					continue
+				}
+
+				// Validate latitude: -85.05112878 to +85.05112878 (inclusive)
+				if latitude < -85.05112878 || latitude > 85.05112878 {
+					errorMsg := fmt.Sprintf("-ERR invalid longitude,latitude pair %f,%f\r\n", longitude, latitude)
+					conn.Write([]byte(errorMsg))
+					continue
+				}
+
+				// For now, just return 1 (number of locations added)
+				// We'll store locations in later stages
+				_ = key
+				_ = member
+				conn.Write([]byte(":1\r\n"))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'geoadd' command\r\n"))
+			}
 		}
 	}
 }
