@@ -2232,23 +2232,25 @@ func handleClient(conn net.Conn) {
 				response.WriteString(fmt.Sprintf("*%d\r\n", len(members)))
 
 				for _, member := range members {
-					// Check if member exists in the sorted set
+					// Check if member exists in the sorted set and get its score
 					memberExists := false
+					var score float64
 					if keyExists {
 						for _, m := range item.sortedSet {
 							if m.member == member {
 								memberExists = true
+								score = m.score
 								break
 							}
 						}
 					}
 
 					if memberExists {
-						// Return array with [lon, lat] - for now hardcoded to "0"
-						// We'll decode from geohash in later stages
-						lon := "0"
-						lat := "0"
-						response.WriteString(fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(lon), lon, len(lat), lat))
+						// Decode the geohash score back to lon/lat
+						lon, lat := geohashDecode(uint64(score))
+						lonStr := fmt.Sprintf("%f", lon)
+						latStr := fmt.Sprintf("%f", lat)
+						response.WriteString(fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(lonStr), lonStr, len(latStr), latStr))
 					} else {
 						// Return null array for non-existent member
 						response.WriteString("*-1\r\n")
@@ -2298,6 +2300,43 @@ func geohashEncode(longitude float64, latitude float64) uint64 {
 	}
 
 	return score
+}
+
+// geohashDecode converts a 52-bit geohash integer back to latitude and longitude
+// This is the reverse of geohashEncode
+func geohashDecode(score uint64) (longitude float64, latitude float64) {
+	// WGS84 ranges - Web Mercator projection limits
+	lonMin, lonMax := -180.0, 180.0
+	latMin, latMax := -85.05112878, 85.05112878
+
+	// Decode 52 bits by alternating between longitude and latitude
+	// We read bits from most significant to least significant (left to right)
+	// Even bits (0, 2, 4, ...) = longitude
+	// Odd bits (1, 3, 5, ...) = latitude
+	for i := 51; i >= 0; i-- {
+		bit := (score >> i) & 1
+
+		if (51-i)%2 == 0 { // longitude bit
+			xmid := (lonMin + lonMax) / 2
+			if bit == 0 {
+				lonMax = xmid // left half
+			} else {
+				lonMin = xmid // right half
+			}
+		} else { // latitude bit
+			ymid := (latMin + latMax) / 2
+			if bit == 0 {
+				latMax = ymid // bottom half
+			} else {
+				latMin = ymid // top half
+			}
+		}
+	}
+
+	// Return the midpoint of the final ranges
+	longitude = (lonMin + lonMax) / 2
+	latitude = (latMin + latMax) / 2
+	return
 }
 
 // loadRDB loads an RDB file and populates the store
