@@ -23,11 +23,17 @@ type streamEntry struct {
 	fields map[string]string
 }
 
+type sortedSetMember struct {
+	member string
+	score  float64
+}
+
 type storeItem struct {
-	value  string
-	list   []string
-	stream []streamEntry
-	expiry *time.Time
+	value     string
+	list      []string
+	stream    []streamEntry
+	sortedSet []sortedSetMember // Members stored in sorted order by score
+	expiry    *time.Time
 }
 
 type blockedClient struct {
@@ -1802,6 +1808,75 @@ func handleClient(conn net.Conn) {
 				conn.Write([]byte(response))
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'unsubscribe' command\r\n"))
+			}
+		case "ZADD":
+			if len(args) >= 4 {
+				key := args[1]
+				scoreStr := args[2]
+				member := args[3]
+
+				// Parse score as float64
+				score, err := strconv.ParseFloat(scoreStr, 64)
+				if err != nil {
+					conn.Write([]byte("-ERR value is not a valid float\r\n"))
+					continue
+				}
+
+				storeMutex.Lock()
+				item, exists := store[key]
+
+				// Check if member already exists
+				memberExists := false
+				if exists {
+					for _, m := range item.sortedSet {
+						if m.member == member {
+							memberExists = true
+							break
+						}
+					}
+				}
+
+				if !exists {
+					// Create new sorted set with this member
+					store[key] = storeItem{
+						sortedSet: []sortedSetMember{{member: member, score: score}},
+					}
+				} else {
+					// Add member to existing sorted set if it doesn't exist
+					if !memberExists {
+						// Insert member in sorted position
+						newMember := sortedSetMember{member: member, score: score}
+						inserted := false
+
+						for i, m := range item.sortedSet {
+							if score < m.score || (score == m.score && member < m.member) {
+								// Insert before this position
+								item.sortedSet = append(item.sortedSet[:i], append([]sortedSetMember{newMember}, item.sortedSet[i:]...)...)
+								inserted = true
+								break
+							}
+						}
+
+						if !inserted {
+							// Append at the end
+							item.sortedSet = append(item.sortedSet, newMember)
+						}
+
+						store[key] = item
+					}
+				}
+
+				storeMutex.Unlock()
+
+				// Return number of members added (1 if new, 0 if already existed)
+				added := 0
+				if !memberExists {
+					added = 1
+				}
+				response := fmt.Sprintf(":%d\r\n", added)
+				conn.Write([]byte(response))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'zadd' command\r\n"))
 			}
 		}
 	}
