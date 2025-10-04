@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -2261,6 +2262,55 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'geopos' command\r\n"))
 			}
+		case "GEODIST":
+			if len(args) >= 4 {
+				key := args[1]
+				member1 := args[2]
+				member2 := args[3]
+
+				storeMutex.RLock()
+				item, keyExists := store[key]
+				storeMutex.RUnlock()
+
+				// Find both members and their scores
+				var score1, score2 float64
+				member1Exists := false
+				member2Exists := false
+
+				if keyExists {
+					for _, m := range item.sortedSet {
+						if m.member == member1 {
+							member1Exists = true
+							score1 = m.score
+						}
+						if m.member == member2 {
+							member2Exists = true
+							score2 = m.score
+						}
+					}
+				}
+
+				// If either member doesn't exist, return null bulk string
+				if !member1Exists || !member2Exists {
+					conn.Write([]byte("$-1\r\n"))
+				} else {
+					// Decode both coordinates
+					lon1, lat1 := geohashDecode(uint64(score1))
+					lon2, lat2 := geohashDecode(uint64(score2))
+
+					// Calculate distance using Haversine formula
+					distance := geohashDistance(lon1, lat1, lon2, lat2)
+
+					// Format distance as string
+					distanceStr := fmt.Sprintf("%f", distance)
+
+					// Return as RESP bulk string
+					response := fmt.Sprintf("$%d\r\n%s\r\n", len(distanceStr), distanceStr)
+					conn.Write([]byte(response))
+				}
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'geodist' command\r\n"))
+			}
 		}
 	}
 }
@@ -2337,6 +2387,36 @@ func geohashDecode(score uint64) (longitude float64, latitude float64) {
 	longitude = (lonMin + lonMax) / 2
 	latitude = (latMin + latMax) / 2
 	return
+}
+
+// geohashDistance calculates the distance between two points using Haversine formula
+// Returns distance in meters
+func geohashDistance(lon1, lat1, lon2, lat2 float64) float64 {
+	// Earth's radius in meters (exact value used by Redis)
+	const earthRadiusMeters = 6372797.560856
+
+	// Convert degrees to radians
+	toRadians := func(deg float64) float64 {
+		return deg * math.Pi / 180.0
+	}
+
+	lat1Rad := toRadians(lat1)
+	lat2Rad := toRadians(lat2)
+	lon1Rad := toRadians(lon1)
+	lon2Rad := toRadians(lon2)
+
+	// Haversine formula
+	dLat := lat2Rad - lat1Rad
+	dLon := lon2Rad - lon1Rad
+
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1Rad)*math.Cos(lat2Rad)*
+			math.Sin(dLon/2)*math.Sin(dLon/2)
+
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+
+	distance := earthRadiusMeters * c
+	return distance
 }
 
 // loadRDB loads an RDB file and populates the store
