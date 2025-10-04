@@ -2076,6 +2076,42 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'zscore' command\r\n"))
 			}
+		case "ZREM":
+			if len(args) >= 3 {
+				key := args[1]
+				member := args[2]
+
+				storeMutex.Lock()
+				item, exists := store[key]
+
+				// Check if sorted set exists
+				if !exists || len(item.sortedSet) == 0 {
+					// Key doesn't exist or is not a sorted set
+					storeMutex.Unlock()
+					conn.Write([]byte(":0\r\n"))
+					continue
+				}
+
+				// Find and remove the member
+				removed := 0
+				for i, m := range item.sortedSet {
+					if m.member == member {
+						// Remove this member
+						item.sortedSet = append(item.sortedSet[:i], item.sortedSet[i+1:]...)
+						store[key] = item
+						removed = 1
+						break
+					}
+				}
+
+				storeMutex.Unlock()
+
+				// Return number of members removed (1 if found, 0 if not)
+				response := fmt.Sprintf(":%d\r\n", removed)
+				conn.Write([]byte(response))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'zrem' command\r\n"))
+			}
 		}
 	}
 }
