@@ -1914,6 +1914,67 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'zrank' command\r\n"))
 			}
+		case "ZRANGE":
+			if len(args) >= 4 {
+				key := args[1]
+				startStr := args[2]
+				stopStr := args[3]
+
+				// Parse start and stop indices
+				start, err := strconv.Atoi(startStr)
+				if err != nil {
+					conn.Write([]byte("-ERR value is not an integer or out of range\r\n"))
+					continue
+				}
+
+				stop, err := strconv.Atoi(stopStr)
+				if err != nil {
+					conn.Write([]byte("-ERR value is not an integer or out of range\r\n"))
+					continue
+				}
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				// If sorted set doesn't exist, return empty array
+				if !exists || len(item.sortedSet) == 0 {
+					conn.Write([]byte("*0\r\n"))
+					continue
+				}
+
+				setLen := len(item.sortedSet)
+
+				// If start >= setLen, return empty array
+				if start >= setLen {
+					conn.Write([]byte("*0\r\n"))
+					continue
+				}
+
+				// If stop > setLen, treat stop as last element
+				if stop >= setLen {
+					stop = setLen - 1
+				}
+
+				// If start > stop, return empty array
+				if start > stop {
+					conn.Write([]byte("*0\r\n"))
+					continue
+				}
+
+				// Extract members in range [start, stop] inclusive
+				members := item.sortedSet[start : stop+1]
+
+				// Build RESP array response
+				response := fmt.Sprintf("*%d\r\n", len(members))
+				for _, m := range members {
+					response += fmt.Sprintf("$%d\r\n%s\r\n", len(m.member), m.member)
+				}
+
+				conn.Write([]byte(response))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'zrange' command\r\n"))
+			}
 		}
 	}
 }
