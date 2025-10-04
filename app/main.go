@@ -2311,6 +2311,91 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'geodist' command\r\n"))
 			}
+		case "GEOSEARCH":
+			if len(args) >= 8 {
+				key := args[1]
+
+				// Parse FROMLONLAT option
+				var centerLon, centerLat float64
+				if strings.ToUpper(args[2]) == "FROMLONLAT" {
+					var err error
+					centerLon, err = strconv.ParseFloat(args[3], 64)
+					if err != nil {
+						conn.Write([]byte("-ERR invalid longitude\r\n"))
+						continue
+					}
+					centerLat, err = strconv.ParseFloat(args[4], 64)
+					if err != nil {
+						conn.Write([]byte("-ERR invalid latitude\r\n"))
+						continue
+					}
+				} else {
+					conn.Write([]byte("-ERR FROMLONLAT option required\r\n"))
+					continue
+				}
+
+				// Parse BYRADIUS option
+				var radiusMeters float64
+				if strings.ToUpper(args[5]) == "BYRADIUS" {
+					radius, err := strconv.ParseFloat(args[6], 64)
+					if err != nil {
+						conn.Write([]byte("-ERR invalid radius\r\n"))
+						continue
+					}
+
+					// Convert radius to meters based on unit
+					unit := strings.ToLower(args[7])
+					switch unit {
+					case "m":
+						radiusMeters = radius
+					case "km":
+						radiusMeters = radius * 1000
+					case "mi":
+						radiusMeters = radius * 1609.34
+					case "ft":
+						radiusMeters = radius * 0.3048
+					default:
+						conn.Write([]byte("-ERR unsupported unit\r\n"))
+						continue
+					}
+				} else {
+					conn.Write([]byte("-ERR BYRADIUS option required\r\n"))
+					continue
+				}
+
+				// Search for locations within radius
+				storeMutex.RLock()
+				item, keyExists := store[key]
+				storeMutex.RUnlock()
+
+				var matchingMembers []string
+
+				if keyExists {
+					for _, m := range item.sortedSet {
+						// Decode member's coordinates
+						memberLon, memberLat := geohashDecode(uint64(m.score))
+
+						// Calculate distance from center point
+						distance := geohashDistance(centerLon, centerLat, memberLon, memberLat)
+
+						// Check if within radius
+						if distance <= radiusMeters {
+							matchingMembers = append(matchingMembers, m.member)
+						}
+					}
+				}
+
+				// Build RESP array response
+				var response strings.Builder
+				response.WriteString(fmt.Sprintf("*%d\r\n", len(matchingMembers)))
+				for _, member := range matchingMembers {
+					response.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(member), member))
+				}
+
+				conn.Write([]byte(response.String()))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'geosearch' command\r\n"))
+			}
 		}
 	}
 }
