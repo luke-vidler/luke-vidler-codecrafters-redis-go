@@ -438,37 +438,11 @@ func executeCommand(args []string, conn net.Conn) string {
 
 	switch command {
 	case "PING":
-		return "+PONG\r\n"
+		return handlePING(args, conn)
 	case "ECHO":
-		if len(args) >= 2 {
-			arg := args[1]
-			return fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
-		}
-		return "$-1\r\n"
+		return handleECHO(args, conn)
 	case "SET":
-		if len(args) >= 3 {
-			key := args[1]
-			value := args[2]
-			var expiry *time.Time
-
-			// Parse PX option
-			for i := 3; i < len(args)-1; i++ {
-				if strings.ToUpper(args[i]) == "PX" && i+1 < len(args) {
-					if expiryMs, err := strconv.Atoi(args[i+1]); err == nil {
-						expiryTime := time.Now().Add(time.Duration(expiryMs) * time.Millisecond)
-						expiry = &expiryTime
-					}
-					break
-				}
-			}
-
-			storeMutex.Lock()
-			store[key] = storeItem{value: value, expiry: expiry}
-			storeMutex.Unlock()
-
-			return "+OK\r\n"
-		}
-		return "-ERR wrong number of arguments\r\n"
+		return handleSET(args, conn)
 	case "GET":
 		if len(args) >= 2 {
 			key := args[1]
@@ -492,41 +466,7 @@ func executeCommand(args []string, conn net.Conn) string {
 		}
 		return "$-1\r\n"
 	case "INCR":
-		if len(args) >= 2 {
-			key := args[1]
-
-			storeMutex.Lock()
-			item, exists := store[key]
-
-			// Check if key exists and is not expired
-			if exists && (item.expiry == nil || item.expiry.After(time.Now())) {
-				// Try to parse the current value as an integer
-				currentValue, err := strconv.Atoi(item.value)
-				if err != nil {
-					storeMutex.Unlock()
-					return "-ERR value is not an integer or out of range\r\n"
-				}
-
-				// Increment the value
-				newValue := currentValue + 1
-
-				// Store the new value back
-				item.value = strconv.Itoa(newValue)
-				store[key] = item
-				storeMutex.Unlock()
-
-				// Return the new value as a RESP integer
-				return fmt.Sprintf(":%d\r\n", newValue)
-			} else {
-				// Key doesn't exist or is expired, set to 1
-				store[key] = storeItem{value: "1"}
-				storeMutex.Unlock()
-
-				// Return 1 as a RESP integer
-				return ":1\r\n"
-			}
-		}
-		return "-ERR wrong number of arguments\r\n"
+		return handleINCR(args, conn)
 	default:
 		return "-ERR unknown command\r\n"
 	}
