@@ -1993,6 +1993,26 @@ func handleClient(conn net.Conn) {
 			} else {
 				conn.Write([]byte("-ERR wrong number of arguments for 'zrange' command\r\n"))
 			}
+		case "ZCARD":
+			if len(args) >= 2 {
+				key := args[1]
+
+				storeMutex.RLock()
+				item, exists := store[key]
+				storeMutex.RUnlock()
+
+				// If sorted set doesn't exist, return 0
+				cardinality := 0
+				if exists && len(item.sortedSet) > 0 {
+					cardinality = len(item.sortedSet)
+				}
+
+				// Return cardinality as RESP integer
+				response := fmt.Sprintf(":%d\r\n", cardinality)
+				conn.Write([]byte(response))
+			} else {
+				conn.Write([]byte("-ERR wrong number of arguments for 'zcard' command\r\n"))
+			}
 		}
 	}
 }
