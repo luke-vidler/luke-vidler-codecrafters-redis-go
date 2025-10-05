@@ -11,7 +11,7 @@ import (
 
 // LoadRDB loads an RDB file and populates the store.
 // Returns nil if the file doesn't exist (treating it as an empty database).
-func LoadRDB(filePath string) error {
+func (s *Server) LoadRDB(filePath string) error {
 	file, err := os.Open(filePath)
 	if err != nil {
 		// File doesn't exist or can't be opened - treat as empty database
@@ -88,7 +88,7 @@ func LoadRDB(filePath string) error {
 			expiryTime := time.Unix(int64(expirySeconds), 0)
 
 			// Read the key-value pair with this expiry
-			if err := readKeyValuePair(reader, &expiryTime); err != nil {
+			if err := s.readKeyValuePair(reader, &expiryTime); err != nil {
 				return fmt.Errorf("failed to read key-value pair with expiry: %w", err)
 			}
 		case 0xFC: // EXPIRETIME_MS (milliseconds)
@@ -101,12 +101,12 @@ func LoadRDB(filePath string) error {
 			expiryTime := time.Unix(0, int64(expiryMillis)*int64(time.Millisecond))
 
 			// Read the key-value pair with this expiry
-			if err := readKeyValuePair(reader, &expiryTime); err != nil {
+			if err := s.readKeyValuePair(reader, &expiryTime); err != nil {
 				return fmt.Errorf("failed to read key-value pair with expiry ms: %w", err)
 			}
 		default:
 			// This is a value type byte, read key-value pair
-			if err := readKeyValuePairWithType(reader, opcode, nil); err != nil {
+			if err := s.readKeyValuePairWithType(reader, opcode, nil); err != nil {
 				return fmt.Errorf("failed to read key-value pair: %w", err)
 			}
 		}
@@ -224,18 +224,18 @@ func readString(reader *bufio.Reader) (string, error) {
 }
 
 // readKeyValuePair reads a key-value pair from the RDB file (when the value type byte hasn't been read yet).
-func readKeyValuePair(reader *bufio.Reader, expiry *time.Time) error {
+func (s *Server) readKeyValuePair(reader *bufio.Reader, expiry *time.Time) error {
 	// Read value type
 	valueType, err := reader.ReadByte()
 	if err != nil {
 		return err
 	}
 
-	return readKeyValuePairWithType(reader, valueType, expiry)
+	return s.readKeyValuePairWithType(reader, valueType, expiry)
 }
 
 // readKeyValuePairWithType reads a key-value pair when the value type byte has already been read.
-func readKeyValuePairWithType(reader *bufio.Reader, valueType byte, expiry *time.Time) error {
+func (s *Server) readKeyValuePairWithType(reader *bufio.Reader, valueType byte, expiry *time.Time) error {
 	// Read key
 	key, err := readString(reader)
 	if err != nil {
@@ -251,12 +251,12 @@ func readKeyValuePairWithType(reader *bufio.Reader, valueType byte, expiry *time
 		}
 
 		// Store in the global store
-		storeMutex.Lock()
-		store[key] = storeItem{
+		s.store.mutex.Lock()
+		s.store.data[key] = storeItem{
 			value:  value,
 			expiry: expiry,
 		}
-		storeMutex.Unlock()
+		s.store.mutex.Unlock()
 
 	default:
 		return fmt.Errorf("unsupported value type: %d", valueType)

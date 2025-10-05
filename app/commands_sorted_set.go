@@ -7,7 +7,7 @@ import (
 )
 
 // handleZADD handles the ZADD command which adds members with scores to a sorted set
-func handleZADD(args []string, conn net.Conn) {
+func (s *Server) handleZADD(args []string, conn net.Conn) {
 	if len(args) >= 4 {
 		key := args[1]
 		scoreStr := args[2]
@@ -20,8 +20,8 @@ func handleZADD(args []string, conn net.Conn) {
 			return
 		}
 
-		storeMutex.Lock()
-		item, exists := store[key]
+		s.store.mutex.Lock()
+		item, exists := s.store.data[key]
 
 		// Check if member already exists and find its index
 		memberExists := false
@@ -38,7 +38,7 @@ func handleZADD(args []string, conn net.Conn) {
 
 		if !exists {
 			// Create new sorted set with this member
-			store[key] = storeItem{
+			s.store.data[key] = storeItem{
 				sortedSet: []sortedSetMember{{member: member, score: score}},
 			}
 		} else if memberExists {
@@ -64,7 +64,7 @@ func handleZADD(args []string, conn net.Conn) {
 				item.sortedSet = append(item.sortedSet, newMember)
 			}
 
-			store[key] = item
+			s.store.data[key] = item
 		} else {
 			// Add new member to existing sorted set
 			// Insert member in sorted position
@@ -85,10 +85,10 @@ func handleZADD(args []string, conn net.Conn) {
 				item.sortedSet = append(item.sortedSet, newMember)
 			}
 
-			store[key] = item
+			s.store.data[key] = item
 		}
 
-		storeMutex.Unlock()
+		s.store.mutex.Unlock()
 
 		// Return number of members added (1 if new, 0 if already existed)
 		added := 0
@@ -103,14 +103,14 @@ func handleZADD(args []string, conn net.Conn) {
 }
 
 // handleZRANK handles the ZRANK command which returns the rank of a member in a sorted set
-func handleZRANK(args []string, conn net.Conn) {
+func (s *Server) handleZRANK(args []string, conn net.Conn) {
 	if len(args) >= 3 {
 		key := args[1]
 		member := args[2]
 
-		storeMutex.RLock()
-		item, exists := store[key]
-		storeMutex.RUnlock()
+		s.store.mutex.RLock()
+		item, exists := s.store.data[key]
+		s.store.mutex.RUnlock()
 
 		// Check if sorted set exists
 		if !exists || len(item.sortedSet) == 0 {
@@ -142,7 +142,7 @@ func handleZRANK(args []string, conn net.Conn) {
 }
 
 // handleZRANGE handles the ZRANGE command which returns members in a sorted set within a range
-func handleZRANGE(args []string, conn net.Conn) {
+func (s *Server) handleZRANGE(args []string, conn net.Conn) {
 	if len(args) >= 4 {
 		key := args[1]
 		startStr := args[2]
@@ -161,9 +161,9 @@ func handleZRANGE(args []string, conn net.Conn) {
 			return
 		}
 
-		storeMutex.RLock()
-		item, exists := store[key]
-		storeMutex.RUnlock()
+		s.store.mutex.RLock()
+		item, exists := s.store.data[key]
+		s.store.mutex.RUnlock()
 
 		// If sorted set doesn't exist, return empty array
 		if !exists || len(item.sortedSet) == 0 {
@@ -224,13 +224,13 @@ func handleZRANGE(args []string, conn net.Conn) {
 }
 
 // handleZCARD handles the ZCARD command which returns the cardinality of a sorted set
-func handleZCARD(args []string, conn net.Conn) {
+func (s *Server) handleZCARD(args []string, conn net.Conn) {
 	if len(args) >= 2 {
 		key := args[1]
 
-		storeMutex.RLock()
-		item, exists := store[key]
-		storeMutex.RUnlock()
+		s.store.mutex.RLock()
+		item, exists := s.store.data[key]
+		s.store.mutex.RUnlock()
 
 		// If sorted set doesn't exist, return 0
 		cardinality := 0
@@ -247,14 +247,14 @@ func handleZCARD(args []string, conn net.Conn) {
 }
 
 // handleZSCORE handles the ZSCORE command which returns the score of a member in a sorted set
-func handleZSCORE(args []string, conn net.Conn) {
+func (s *Server) handleZSCORE(args []string, conn net.Conn) {
 	if len(args) >= 3 {
 		key := args[1]
 		member := args[2]
 
-		storeMutex.RLock()
-		item, exists := store[key]
-		storeMutex.RUnlock()
+		s.store.mutex.RLock()
+		item, exists := s.store.data[key]
+		s.store.mutex.RUnlock()
 
 		// Check if sorted set exists
 		if !exists || len(item.sortedSet) == 0 {
@@ -289,18 +289,18 @@ func handleZSCORE(args []string, conn net.Conn) {
 }
 
 // handleZREM handles the ZREM command which removes members from a sorted set
-func handleZREM(args []string, conn net.Conn) {
+func (s *Server) handleZREM(args []string, conn net.Conn) {
 	if len(args) >= 3 {
 		key := args[1]
 		member := args[2]
 
-		storeMutex.Lock()
-		item, exists := store[key]
+		s.store.mutex.Lock()
+		item, exists := s.store.data[key]
 
 		// Check if sorted set exists
 		if !exists || len(item.sortedSet) == 0 {
 			// Key doesn't exist or is not a sorted set
-			storeMutex.Unlock()
+			s.store.mutex.Unlock()
 			conn.Write([]byte(":0\r\n"))
 			return
 		}
@@ -311,13 +311,13 @@ func handleZREM(args []string, conn net.Conn) {
 			if m.member == member {
 				// Remove this member
 				item.sortedSet = append(item.sortedSet[:i], item.sortedSet[i+1:]...)
-				store[key] = item
+				s.store.data[key] = item
 				removed = 1
 				break
 			}
 		}
 
-		storeMutex.Unlock()
+		s.store.mutex.Unlock()
 
 		// Return number of members removed (1 if found, 0 if not)
 		response := fmt.Sprintf(":%d\r\n", removed)

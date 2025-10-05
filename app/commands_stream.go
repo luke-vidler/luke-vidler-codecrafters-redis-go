@@ -9,7 +9,7 @@ import (
 )
 
 // handleXADD handles the XADD command which adds an entry to a stream
-func handleXADD(args []string, conn net.Conn) {
+func (s *Server) handleXADD(args []string, conn net.Conn) {
 	if len(args) >= 5 && len(args)%2 == 1 { // Must have odd number: XADD key id field1 value1 [field2 value2 ...]
 		key := args[1]
 		entryID := args[2]
@@ -23,13 +23,13 @@ func handleXADD(args []string, conn net.Conn) {
 		var finalEntryID string
 		if isWildcard {
 			// Need to access store to generate sequence number
-			storeMutex.RLock()
-			item, exists := store[key]
+			s.store.mutex.RLock()
+			item, exists := s.store.data[key]
 			var stream []streamEntry
 			if exists {
 				stream = item.stream
 			}
-			storeMutex.RUnlock()
+			s.store.mutex.RUnlock()
 			sequence = generateSequenceNumber(stream, timestamp)
 			finalEntryID = fmt.Sprintf("%d-%d", timestamp, sequence)
 		} else {
@@ -59,34 +59,34 @@ func handleXADD(args []string, conn net.Conn) {
 			id:     finalEntryID,
 			fields: fields,
 		}
-		storeMutex.Lock()
-		item, exists := store[key]
+		s.store.mutex.Lock()
+		item, exists := s.store.data[key]
 		// Check if ID is greater than the last entry (if stream exists)
 		if exists && len(item.stream) > 0 {
 			lastEntry := item.stream[len(item.stream)-1]
 			cmp, err := compareEntryIDs(finalEntryID, lastEntry.id)
 			if err != nil {
-				storeMutex.Unlock()
+				s.store.mutex.Unlock()
 				conn.Write([]byte("-ERR invalid entry ID format\r\n"))
 				return
 			}
 			if cmp <= 0 {
-				storeMutex.Unlock()
+				s.store.mutex.Unlock()
 				conn.Write([]byte("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"))
 				return
 			}
 		}
 		if !exists {
 			// Create new stream
-			store[key] = storeItem{stream: []streamEntry{entry}}
+			s.store.data[key] = storeItem{stream: []streamEntry{entry}}
 		} else {
 			// Append to existing stream
 			item.stream = append(item.stream, entry)
-			store[key] = item
+			s.store.data[key] = item
 		}
-		storeMutex.Unlock()
+		s.store.mutex.Unlock()
 		// Notify blocked stream clients
-		notifyBlockedStreamClients(key)
+		s.notifyBlockedStreamClients(key)
 		// Return the entry ID as a bulk string
 		response := fmt.Sprintf("$%d\r\n%s\r\n", len(finalEntryID), finalEntryID)
 		conn.Write([]byte(response))
@@ -94,12 +94,12 @@ func handleXADD(args []string, conn net.Conn) {
 }
 
 // handleTYPE handles the TYPE command which returns the type of a key
-func handleTYPE(args []string, conn net.Conn) {
+func (s *Server) handleTYPE(args []string, conn net.Conn) {
 	if len(args) >= 2 {
 		key := args[1]
-		storeMutex.RLock()
-		item, exists := store[key]
-		storeMutex.RUnlock()
+		s.store.mutex.RLock()
+		item, exists := s.store.data[key]
+		s.store.mutex.RUnlock()
 		if !exists {
 			// Key doesn't exist
 			conn.Write([]byte("+none\r\n"))
@@ -126,14 +126,14 @@ func handleTYPE(args []string, conn net.Conn) {
 }
 
 // handleXRANGE handles the XRANGE command which returns a range of stream entries
-func handleXRANGE(args []string, conn net.Conn) {
+func (s *Server) handleXRANGE(args []string, conn net.Conn) {
 	if len(args) >= 4 {
 		key := args[1]
 		startID := args[2]
 		endID := args[3]
-		storeMutex.RLock()
-		item, exists := store[key]
-		storeMutex.RUnlock()
+		s.store.mutex.RLock()
+		item, exists := s.store.data[key]
+		s.store.mutex.RUnlock()
 		if !exists {
 			// Stream doesn't exist, return empty array
 			conn.Write([]byte("*0\r\n"))
@@ -161,7 +161,7 @@ func handleXRANGE(args []string, conn net.Conn) {
 }
 
 // handleXREAD handles the XREAD command which reads from one or more streams
-func handleXREAD(args []string, conn net.Conn) {
+func (s *Server) handleXREAD(args []string, conn net.Conn) {
 	// Handle both: XREAD streams key1 key2... id1 id2...
 	// and: XREAD block timeout streams key1 key2... id1 id2...
 	var blockTimeout float64 = -1 // -1 means no blocking
@@ -190,12 +190,12 @@ func handleXREAD(args []string, conn net.Conn) {
 		streamKeys := args[streamsIndex+1 : streamsIndex+1+numStreams]
 		streamIDs := args[streamsIndex+1+numStreams : streamsIndex+1+streamArgsCount]
 		var streamResults []string
-		storeMutex.RLock()
+		s.store.mutex.RLock()
 		// First pass: resolve any $ IDs to actual IDs
 		resolvedStreamIDs := make([]string, len(streamIDs))
 		for i, key := range streamKeys {
 			startID := streamIDs[i]
-			item, exists := store[key]
+			item, exists := s.store.data[key]
 			if !exists {
 				// Stream doesn't exist, treat $ as "0-0"
 				resolvedStreamIDs[i] = resolveStreamID([]streamEntry{}, startID)
@@ -205,7 +205,7 @@ func handleXREAD(args []string, conn net.Conn) {
 		}
 		for i, key := range streamKeys {
 			startID := resolvedStreamIDs[i]
-			item, exists := store[key]
+			item, exists := s.store.data[key]
 			if !exists {
 				// Stream doesn't exist, skip it
 				return
@@ -213,7 +213,7 @@ func handleXREAD(args []string, conn net.Conn) {
 			// Filter entries greater than the start ID (exclusive)
 			filteredEntries, err := filterStreamEntriesGreaterThan(item.stream, startID)
 			if err != nil {
-				storeMutex.RUnlock()
+				s.store.mutex.RUnlock()
 				conn.Write([]byte("-ERR invalid entry ID format\r\n"))
 				return
 			}
@@ -233,7 +233,7 @@ func handleXREAD(args []string, conn net.Conn) {
 				streamResults = append(streamResults, streamResult)
 			}
 		}
-		storeMutex.RUnlock()
+		s.store.mutex.RUnlock()
 		// If we have results or not blocking, return immediately
 		if len(streamResults) > 0 || !isBlocking {
 			// Build final response: array of stream results
@@ -251,9 +251,9 @@ func handleXREAD(args []string, conn net.Conn) {
 			// Create result channel for this blocked client
 			resultCh := make(chan string, 1)
 			// Add client to blocked list for each stream key
-			blockedMutex.Lock()
+			s.blocking.mutex.Lock()
 			for _, key := range streamKeys {
-				blockedStreamClients[key] = append(blockedStreamClients[key], blockedStreamClient{
+				s.blocking.streamClients[key] = append(s.blocking.streamClients[key], blockedStreamClient{
 					conn:       conn,
 					streamKeys: streamKeys,
 					streamIDs:  resolvedStreamIDs, // Use resolved IDs instead of original IDs
@@ -261,7 +261,7 @@ func handleXREAD(args []string, conn net.Conn) {
 					resultCh:   resultCh,
 				})
 			}
-			blockedMutex.Unlock()
+			s.blocking.mutex.Unlock()
 			// Determine timeout duration
 			var timeoutDuration time.Duration
 			if blockTimeout == 0 {
@@ -278,9 +278,9 @@ func handleXREAD(args []string, conn net.Conn) {
 				conn.Write([]byte(response))
 			case <-time.After(timeoutDuration):
 				// Timeout expired, remove from all blocked clients lists and send null
-				blockedMutex.Lock()
+				s.blocking.mutex.Lock()
 				for _, key := range streamKeys {
-					if clients, exists := blockedStreamClients[key]; exists {
+					if clients, exists := s.blocking.streamClients[key]; exists {
 						var remainingClients []blockedStreamClient
 						for _, client := range clients {
 							if client.conn != conn {
@@ -288,13 +288,13 @@ func handleXREAD(args []string, conn net.Conn) {
 							}
 						}
 						if len(remainingClients) == 0 {
-							delete(blockedStreamClients, key)
+							delete(s.blocking.streamClients, key)
 						} else {
-							blockedStreamClients[key] = remainingClients
+							s.blocking.streamClients[key] = remainingClients
 						}
 					}
 				}
-				blockedMutex.Unlock()
+				s.blocking.mutex.Unlock()
 				// Send null array for timeout
 				conn.Write([]byte("*-1\r\n"))
 			}

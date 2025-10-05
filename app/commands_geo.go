@@ -8,7 +8,7 @@ import (
 )
 
 // handleGEOADD handles the GEOADD command which adds geospatial items (longitude, latitude, name) to a sorted set
-func handleGEOADD(args []string, conn net.Conn) {
+func (s *Server) handleGEOADD(args []string, conn net.Conn) {
 	if len(args) < 5 {
 		conn.Write([]byte("-ERR wrong number of arguments for 'geoadd' command\r\n"))
 		return
@@ -47,8 +47,8 @@ func handleGEOADD(args []string, conn net.Conn) {
 	geohash := GeohashEncode(longitude, latitude)
 	score := float64(geohash)
 
-	storeMutex.Lock()
-	item, exists := store[key]
+	s.store.mutex.Lock()
+	item, exists := s.store.data[key]
 
 	// Check if member already exists
 	memberExists := false
@@ -66,7 +66,7 @@ func handleGEOADD(args []string, conn net.Conn) {
 	added := 0
 	if !exists {
 		// Create new sorted set with this member
-		store[key] = storeItem{
+		s.store.data[key] = storeItem{
 			sortedSet: []sortedSetMember{{member: member, score: score}},
 		}
 		added = 1
@@ -89,7 +89,7 @@ func handleGEOADD(args []string, conn net.Conn) {
 		if !inserted {
 			item.sortedSet = append(item.sortedSet, newMember)
 		}
-		store[key] = item
+		s.store.data[key] = item
 		added = 0
 	} else {
 		// Add new member to existing sorted set
@@ -107,18 +107,18 @@ func handleGEOADD(args []string, conn net.Conn) {
 		if !inserted {
 			item.sortedSet = append(item.sortedSet, newMember)
 		}
-		store[key] = item
+		s.store.data[key] = item
 		added = 1
 	}
 
-	storeMutex.Unlock()
+	s.store.mutex.Unlock()
 
 	response := fmt.Sprintf(":%d\r\n", added)
 	conn.Write([]byte(response))
 }
 
 // handleGEOPOS handles the GEOPOS command which returns the coordinates of members in a geospatial index
-func handleGEOPOS(args []string, conn net.Conn) {
+func (s *Server) handleGEOPOS(args []string, conn net.Conn) {
 	if len(args) < 2 {
 		conn.Write([]byte("-ERR wrong number of arguments for 'geopos' command\r\n"))
 		return
@@ -127,9 +127,9 @@ func handleGEOPOS(args []string, conn net.Conn) {
 	key := args[1]
 	members := args[2:]
 
-	storeMutex.RLock()
-	item, keyExists := store[key]
-	storeMutex.RUnlock()
+	s.store.mutex.RLock()
+	item, keyExists := s.store.data[key]
+	s.store.mutex.RUnlock()
 
 	// Build response array
 	var response strings.Builder
@@ -165,7 +165,7 @@ func handleGEOPOS(args []string, conn net.Conn) {
 }
 
 // handleGEODIST handles the GEODIST command which returns the distance between two members
-func handleGEODIST(args []string, conn net.Conn) {
+func (s *Server) handleGEODIST(args []string, conn net.Conn) {
 	if len(args) < 4 {
 		conn.Write([]byte("-ERR wrong number of arguments for 'geodist' command\r\n"))
 		return
@@ -175,9 +175,9 @@ func handleGEODIST(args []string, conn net.Conn) {
 	member1 := args[2]
 	member2 := args[3]
 
-	storeMutex.RLock()
-	item, keyExists := store[key]
-	storeMutex.RUnlock()
+	s.store.mutex.RLock()
+	item, keyExists := s.store.data[key]
+	s.store.mutex.RUnlock()
 
 	// Find both members and their scores
 	var score1, score2 float64
@@ -219,7 +219,7 @@ func handleGEODIST(args []string, conn net.Conn) {
 }
 
 // handleGEOSEARCH handles the GEOSEARCH command which searches for members within a radius
-func handleGEOSEARCH(args []string, conn net.Conn) {
+func (s *Server) handleGEOSEARCH(args []string, conn net.Conn) {
 	if len(args) < 8 {
 		conn.Write([]byte("-ERR wrong number of arguments for 'geosearch' command\r\n"))
 		return
@@ -276,9 +276,9 @@ func handleGEOSEARCH(args []string, conn net.Conn) {
 	}
 
 	// Search for locations within radius
-	storeMutex.RLock()
-	item, keyExists := store[key]
-	storeMutex.RUnlock()
+	s.store.mutex.RLock()
+	item, keyExists := s.store.data[key]
+	s.store.mutex.RUnlock()
 
 	var matchingMembers []string
 

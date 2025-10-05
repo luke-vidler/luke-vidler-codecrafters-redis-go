@@ -56,56 +56,6 @@ type replicaConnection struct {
 	isReplica bool       // Flag to indicate this is a replica connection
 }
 
-var (
-	store                = make(map[string]storeItem)
-	storeMutex           sync.RWMutex
-	blockedClients       = make(map[string][]blockedClient)       // key -> list of blocked clients
-	blockedStreamClients = make(map[string][]blockedStreamClient) // key -> list of blocked stream clients
-	blockedMutex         sync.RWMutex
-	transactionStates    = make(map[net.Conn]bool)       // conn -> is in transaction
-	transactionQueues    = make(map[net.Conn][][]string) // conn -> queue of commands
-	transactionMutex     sync.RWMutex
-	isReplica            = false                                      // Track if server is running as a replica
-	masterHost           = ""                                         // Master host if running as replica
-	masterPort           = ""                                         // Master port if running as replica
-	masterReplid         = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb" // Hardcoded replication ID for master
-	masterReplOffset     = 0                                          // Replication offset for master
-	replicas             []*replicaConnection                         // List of connected replicas
-	replicasMutex        sync.RWMutex
-	replicaOffset        = 0 // Offset for replica - number of bytes of commands processed
-	replicaOffsetMutex   sync.Mutex
-	replicaConnections   = make(map[net.Conn]bool) // Track which connections are replicas
-	replicaConnMutex     sync.RWMutex
-	configDir            = ""                          // RDB file directory
-	configDbFilename     = ""                          // RDB file name
-	clientSubscriptions  = make(map[net.Conn][]string) // conn -> list of subscribed channels
-	channelSubscribers   = make(map[string][]net.Conn) // channel -> list of subscriber connections
-	subscriptionsMutex   sync.RWMutex
-)
-
-// propagateToReplicas sends a command to all connected replicas and returns the number of bytes sent
-func propagateToReplicas(args []string) int {
-	if len(args) == 0 {
-		return 0
-	}
-
-	// Build RESP array for the command
-	resp := fmt.Sprintf("*%d\r\n", len(args))
-	for _, arg := range args {
-		resp += fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
-	}
-
-	replicasMutex.RLock()
-	defer replicasMutex.RUnlock()
-
-	// Send to all replicas
-	for _, replica := range replicas {
-		replica.conn.Write([]byte(resp))
-	}
-
-	return len(resp)
-}
-
 // parseEntryID parses a stream entry ID in format "timestamp-sequence"
 func parseEntryID(id string) (int64, int64, error) {
 	parts := strings.Split(id, "-")
@@ -306,130 +256,7 @@ func resolveStreamID(stream []streamEntry, id string) string {
 	return id
 }
 
-func notifyBlockedClients(key string) {
-	blockedMutex.Lock()
-	defer blockedMutex.Unlock()
-
-	clients, exists := blockedClients[key]
-	if !exists || len(clients) == 0 {
-		return
-	}
-
-	// Process the first (longest waiting) blocked client
-	client := clients[0]
-	blockedClients[key] = clients[1:] // Remove the first client
-
-	// If no more clients, remove the key
-	if len(blockedClients[key]) == 0 {
-		delete(blockedClients, key)
-	}
-
-	// Try to pop an element for the unblocked client (synchronously)
-	storeMutex.Lock()
-	item, exists := store[key]
-	if exists && len(item.list) > 0 {
-		element := item.list[0]
-		item.list = item.list[1:]
-		store[key] = item
-		storeMutex.Unlock()
-
-		// Send response through channel
-		response := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-			len(client.listKey), client.listKey, len(element), element)
-
-		select {
-		case client.resultCh <- response:
-		default:
-			// Client might be gone, ignore
-		}
-	} else {
-		storeMutex.Unlock()
-	}
-}
-
-func notifyBlockedStreamClients(key string) {
-	blockedMutex.Lock()
-	defer blockedMutex.Unlock()
-
-	clients, exists := blockedStreamClients[key]
-	if !exists || len(clients) == 0 {
-		return
-	}
-
-	// Process all blocked clients for this stream key
-	var remainingClients []blockedStreamClient
-
-	for _, client := range clients {
-		// Check if this client has new entries available
-		hasNewEntries := false
-		var streamResults []string
-
-		storeMutex.RLock()
-		for i, streamKey := range client.streamKeys {
-			if streamKey != key {
-				continue // Only check the stream that was updated
-			}
-
-			startID := client.streamIDs[i]
-			item, exists := store[streamKey]
-
-			if !exists {
-				continue
-			}
-
-			// Filter entries greater than the start ID (exclusive)
-			filteredEntries, err := filterStreamEntriesGreaterThan(item.stream, startID)
-			if err != nil {
-				continue
-			}
-
-			// Only include streams that have matching entries
-			if len(filteredEntries) > 0 {
-				hasNewEntries = true
-				// Build stream result: [stream_name, [entries]]
-				streamResult := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(streamKey), streamKey, len(filteredEntries))
-				for _, entry := range filteredEntries {
-					// Each entry is an array: [id, [field1, value1, field2, value2, ...]]
-					fieldCount := len(entry.fields) * 2
-					streamResult += fmt.Sprintf("*2\r\n$%d\r\n%s\r\n*%d\r\n", len(entry.id), entry.id, fieldCount)
-					// Add field-value pairs
-					for field, value := range entry.fields {
-						streamResult += fmt.Sprintf("$%d\r\n%s\r\n$%d\r\n%s\r\n", len(field), field, len(value), value)
-					}
-				}
-				streamResults = append(streamResults, streamResult)
-				break // Found new entries for this client
-			}
-		}
-		storeMutex.RUnlock()
-
-		if hasNewEntries {
-			// Build final response: array of stream results
-			response := fmt.Sprintf("*%d\r\n", len(streamResults))
-			for _, streamResult := range streamResults {
-				response += streamResult
-			}
-
-			select {
-			case client.resultCh <- response:
-			default:
-				// Client might be gone, ignore
-			}
-		} else {
-			// Keep this client blocked
-			remainingClients = append(remainingClients, client)
-		}
-	}
-
-	// Update the blocked clients list
-	if len(remainingClients) == 0 {
-		delete(blockedStreamClients, key)
-	} else {
-		blockedStreamClients[key] = remainingClients
-	}
-}
-
-func executeCommand(args []string, conn net.Conn) string {
+func (s *Server) executeCommand(args []string, conn net.Conn) string {
 	if len(args) == 0 {
 		return ""
 	}
@@ -438,18 +265,18 @@ func executeCommand(args []string, conn net.Conn) string {
 
 	switch command {
 	case "PING":
-		return handlePING(args, conn)
+		return s.handlePING(args, conn)
 	case "ECHO":
-		return handleECHO(args, conn)
+		return s.handleECHO(args, conn)
 	case "SET":
-		return handleSET(args, conn)
+		return s.handleSET(args, conn)
 	case "GET":
 		if len(args) >= 2 {
 			key := args[1]
 
-			storeMutex.RLock()
-			item, exists := store[key]
-			storeMutex.RUnlock()
+			s.store.mutex.RLock()
+			item, exists := s.store.data[key]
+			s.store.mutex.RUnlock()
 
 			// Check if key exists and is not expired
 			if exists && (item.expiry == nil || item.expiry.After(time.Now())) {
@@ -457,60 +284,60 @@ func executeCommand(args []string, conn net.Conn) string {
 			} else {
 				// If expired, remove from store
 				if exists && item.expiry != nil && !item.expiry.After(time.Now()) {
-					storeMutex.Lock()
-					delete(store, key)
-					storeMutex.Unlock()
+					s.store.mutex.Lock()
+					delete(s.store.data, key)
+					s.store.mutex.Unlock()
 				}
 				return "$-1\r\n"
 			}
 		}
 		return "$-1\r\n"
 	case "INCR":
-		return handleINCR(args, conn)
+		return s.handleINCR(args, conn)
 	default:
 		return "-ERR unknown command\r\n"
 	}
 }
 
-func handleClient(conn net.Conn) {
+func (s *Server) handleClient(conn net.Conn) {
 	defer func() {
 		// Only close if it's not a replica connection
-		replicaConnMutex.RLock()
-		isReplicaConn := replicaConnections[conn]
-		replicaConnMutex.RUnlock()
+		s.replication.replicaConnMutex.RLock()
+		isReplicaConn := s.replication.replicaConnections[conn]
+		s.replication.replicaConnMutex.RUnlock()
 
 		if !isReplicaConn {
 			conn.Close()
 		}
 
 		// Clean up transaction state when connection closes
-		transactionMutex.Lock()
-		delete(transactionStates, conn)
-		delete(transactionQueues, conn)
-		transactionMutex.Unlock()
+		s.transactions.mutex.Lock()
+		delete(s.transactions.states, conn)
+		delete(s.transactions.queues, conn)
+		s.transactions.mutex.Unlock()
 
 		// Clean up subscription state when connection closes
-		subscriptionsMutex.Lock()
+		s.pubsub.mutex.Lock()
 		// Remove client from all channel subscriber lists
-		if channels, exists := clientSubscriptions[conn]; exists {
+		if channels, exists := s.pubsub.clientSubscriptions[conn]; exists {
 			for _, channel := range channels {
-				if subscribers, ok := channelSubscribers[channel]; ok {
+				if subscribers, ok := s.pubsub.channelSubscribers[channel]; ok {
 					// Remove this connection from the channel's subscriber list
 					for i, sub := range subscribers {
 						if sub == conn {
-							channelSubscribers[channel] = append(subscribers[:i], subscribers[i+1:]...)
+							s.pubsub.channelSubscribers[channel] = append(subscribers[:i], subscribers[i+1:]...)
 							break
 						}
 					}
 					// Remove channel entry if no more subscribers
-					if len(channelSubscribers[channel]) == 0 {
-						delete(channelSubscribers, channel)
+					if len(s.pubsub.channelSubscribers[channel]) == 0 {
+						delete(s.pubsub.channelSubscribers, channel)
 					}
 				}
 			}
 		}
-		delete(clientSubscriptions, conn)
-		subscriptionsMutex.Unlock()
+		delete(s.pubsub.clientSubscriptions, conn)
+		s.pubsub.mutex.Unlock()
 	}()
 	reader := bufio.NewReader(conn)
 
@@ -528,9 +355,9 @@ func handleClient(conn net.Conn) {
 		command := strings.ToUpper(args[0])
 
 		// Check if client is in subscribed mode
-		subscriptionsMutex.RLock()
-		inSubscribedMode := len(clientSubscriptions[conn]) > 0
-		subscriptionsMutex.RUnlock()
+		s.pubsub.mutex.RLock()
+		inSubscribedMode := len(s.pubsub.clientSubscriptions[conn]) > 0
+		s.pubsub.mutex.RUnlock()
 
 		// In subscribed mode, only allow specific commands
 		if inSubscribedMode {
@@ -552,15 +379,15 @@ func handleClient(conn net.Conn) {
 		}
 
 		// Check if we're in a transaction and should queue commands
-		transactionMutex.RLock()
-		inTransaction := transactionStates[conn]
-		transactionMutex.RUnlock()
+		s.transactions.mutex.RLock()
+		inTransaction := s.transactions.states[conn]
+		s.transactions.mutex.RUnlock()
 
 		if inTransaction && command != "EXEC" && command != "MULTI" && command != "DISCARD" {
 			// Queue the command instead of executing it
-			transactionMutex.Lock()
-			transactionQueues[conn] = append(transactionQueues[conn], args)
-			transactionMutex.Unlock()
+			s.transactions.mutex.Lock()
+			s.transactions.queues[conn] = append(s.transactions.queues[conn], args)
+			s.transactions.mutex.Unlock()
 			conn.Write([]byte("+QUEUED\r\n"))
 			continue
 		}
@@ -600,26 +427,26 @@ func handleClient(conn net.Conn) {
 					}
 				}
 
-				storeMutex.Lock()
-				store[key] = storeItem{value: value, expiry: expiry}
-				storeMutex.Unlock()
+				s.store.mutex.Lock()
+				s.store.data[key] = storeItem{value: value, expiry: expiry}
+				s.store.mutex.Unlock()
 
 				conn.Write([]byte("+OK\r\n"))
 
-				// Propagate to replicas if this is a master
-				if !isReplica {
-					bytesWritten := propagateToReplicas(args)
+				// Propagate to s.replication.replicas if this is a master
+				if !s.replication.isReplica {
+					bytesWritten := s.propagateToReplicas(args)
 					// Update master offset
-					masterReplOffset += bytesWritten
+					s.replication.masterReplOffset += bytesWritten
 				}
 			}
 		case "GET":
 			if len(args) >= 2 {
 				key := args[1]
 
-				storeMutex.RLock()
-				item, exists := store[key]
-				storeMutex.RUnlock()
+				s.store.mutex.RLock()
+				item, exists := s.store.data[key]
+				s.store.mutex.RUnlock()
 
 				// Check if key exists and is not expired
 				if exists && (item.expiry == nil || item.expiry.After(time.Now())) {
@@ -628,47 +455,47 @@ func handleClient(conn net.Conn) {
 				} else {
 					// If expired, remove from store
 					if exists && item.expiry != nil && !item.expiry.After(time.Now()) {
-						storeMutex.Lock()
-						delete(store, key)
-						storeMutex.Unlock()
+						s.store.mutex.Lock()
+						delete(s.store.data, key)
+						s.store.mutex.Unlock()
 
 					}
 					conn.Write([]byte("$-1\r\n"))
 				}
 			}
 		case "RPUSH":
-			handleRPUSH(args, conn)
+			s.handleRPUSH(args, conn)
 		case "LRANGE":
-			handleLRANGE(args, conn)
+			s.handleLRANGE(args, conn)
 		case "LPUSH":
-			handleLPUSH(args, conn)
+			s.handleLPUSH(args, conn)
 		case "LLEN":
-			handleLLEN(args, conn)
+			s.handleLLEN(args, conn)
 		case "LPOP":
-			handleLPOP(args, conn)
+			s.handleLPOP(args, conn)
 		case "BLPOP":
-			handleBLPOP(args, conn)
+			s.handleBLPOP(args, conn)
 		case "XADD":
-			handleXADD(args, conn)
+			s.handleXADD(args, conn)
 		case "TYPE":
-			handleTYPE(args, conn)
+			s.handleTYPE(args, conn)
 		case "XRANGE":
-			handleXRANGE(args, conn)
+			s.handleXRANGE(args, conn)
 		case "XREAD":
-			handleXREAD(args, conn)
+			s.handleXREAD(args, conn)
 		case "INCR":
 			if len(args) >= 2 {
 				key := args[1]
 
-				storeMutex.Lock()
-				item, exists := store[key]
+				s.store.mutex.Lock()
+				item, exists := s.store.data[key]
 
 				// Check if key exists and is not expired
 				if exists && (item.expiry == nil || item.expiry.After(time.Now())) {
 					// Try to parse the current value as an integer
 					currentValue, err := strconv.Atoi(item.value)
 					if err != nil {
-						storeMutex.Unlock()
+						s.store.mutex.Unlock()
 						conn.Write([]byte("-ERR value is not an integer or out of range\r\n"))
 						continue
 					}
@@ -678,16 +505,16 @@ func handleClient(conn net.Conn) {
 
 					// Store the new value back
 					item.value = strconv.Itoa(newValue)
-					store[key] = item
-					storeMutex.Unlock()
+					s.store.data[key] = item
+					s.store.mutex.Unlock()
 
 					// Return the new value as a RESP integer
 					response := fmt.Sprintf(":%d\r\n", newValue)
 					conn.Write([]byte(response))
 				} else {
 					// Key doesn't exist or is expired, set to 1
-					store[key] = storeItem{value: "1"}
-					storeMutex.Unlock()
+					s.store.data[key] = storeItem{value: "1"}
+					s.store.mutex.Unlock()
 
 					// Return 1 as a RESP integer
 					conn.Write([]byte(":1\r\n"))
@@ -697,10 +524,10 @@ func handleClient(conn net.Conn) {
 			if len(args) >= 2 && strings.ToLower(args[1]) == "replication" {
 				// Return replication section with appropriate role
 				var info string
-				if isReplica {
+				if s.replication.isReplica {
 					info = "role:slave"
 				} else {
-					info = fmt.Sprintf("role:master\r\nmaster_replid:%s\r\nmaster_repl_offset:%d", masterReplid, masterReplOffset)
+					info = fmt.Sprintf("role:master\r\nmaster_replid:%s\r\nmaster_repl_offset:%d", s.replication.masterReplid, s.replication.masterReplOffset)
 				}
 				response := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
 				conn.Write([]byte(response))
@@ -709,13 +536,13 @@ func handleClient(conn net.Conn) {
 				conn.Write([]byte("-ERR unknown section or missing argument\r\n"))
 			}
 		case "REPLCONF":
-			// Handle REPLCONF command from replicas during handshake
+			// Handle REPLCONF command from s.replication.replicas during handshake
 			// We can ignore the arguments and just respond with OK
 			conn.Write([]byte("+OK\r\n"))
 		case "PSYNC":
-			// Handle PSYNC command from replicas during handshake
+			// Handle PSYNC command from s.replication.replicas during handshake
 			// Respond with FULLRESYNC <REPL_ID> <OFFSET>
-			response := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplid, masterReplOffset)
+			response := fmt.Sprintf("+FULLRESYNC %s %d\r\n", s.replication.masterReplid, s.replication.masterReplOffset)
 			conn.Write([]byte(response))
 
 			// Send empty RDB file
@@ -735,18 +562,18 @@ func handleClient(conn net.Conn) {
 			conn.Write(emptyRDB)
 
 			// Mark this connection as a replica
-			replicaConnMutex.Lock()
-			replicaConnections[conn] = true
-			replicaConnMutex.Unlock()
+			s.replication.replicaConnMutex.Lock()
+			s.replication.replicaConnections[conn] = true
+			s.replication.replicaConnMutex.Unlock()
 
-			// Add this connection to the list of replicas
-			replicasMutex.Lock()
-			replicas = append(replicas, &replicaConnection{
+			// Add this connection to the list of s.replication.replicas
+			s.replication.replicasMutex.Lock()
+			s.replication.replicas = append(s.replication.replicas, &replicaConnection{
 				conn:      conn,
 				reader:    reader,
 				isReplica: true,
 			})
-			replicasMutex.Unlock()
+			s.replication.replicasMutex.Unlock()
 
 			// Stop processing commands from this connection in handleClient
 			// The WAIT command will handle communication with this replica
@@ -770,24 +597,24 @@ func handleClient(conn net.Conn) {
 				continue
 			}
 
-			replicasMutex.RLock()
-			numReplicas := len(replicas)
-			replicasMutex.RUnlock()
+			s.replication.replicasMutex.RLock()
+			numReplicas := len(s.replication.replicas)
+			s.replication.replicasMutex.RUnlock()
 
-			// If no replicas, return 0 immediately
+			// If no s.replication.replicas, return 0 immediately
 			if numReplicas == 0 {
 				conn.Write([]byte(":0\r\n"))
 				continue
 			}
 
-			// If no writes have been made (offset is 0), all replicas are in sync
-			if masterReplOffset == 0 {
+			// If no writes have been made (offset is 0), all s.replication.replicas are in sync
+			if s.replication.masterReplOffset == 0 {
 				response := fmt.Sprintf(":%d\r\n", numReplicas)
 				conn.Write([]byte(response))
 				continue
 			}
 
-			// Send REPLCONF GETACK to all replicas
+			// Send REPLCONF GETACK to all s.replication.replicas
 			getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
 
 			// Create channels to receive ACK responses
@@ -797,8 +624,8 @@ func handleClient(conn net.Conn) {
 			}
 			ackChan := make(chan ackResponse, numReplicas)
 
-			replicasMutex.RLock()
-			for _, replica := range replicas {
+			s.replication.replicasMutex.RLock()
+			for _, replica := range s.replication.replicas {
 				go func(r *replicaConnection) {
 					// Lock the replica connection for exclusive access
 					r.mutex.Lock()
@@ -835,7 +662,7 @@ func handleClient(conn net.Conn) {
 					}
 				}(replica)
 			}
-			replicasMutex.RUnlock()
+			s.replication.replicasMutex.RUnlock()
 
 			// Wait for responses or timeout
 			timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
@@ -847,9 +674,9 @@ func handleClient(conn net.Conn) {
 				select {
 				case ack := <-ackChan:
 					responsesReceived++
-					if ack.err == nil && ack.offset >= masterReplOffset {
+					if ack.err == nil && ack.offset >= s.replication.masterReplOffset {
 						ackedCount++
-						// Check if we've reached the expected number of replicas
+						// Check if we've reached the expected number of s.replication.replicas
 						if ackedCount >= expectedReplicas {
 							response := fmt.Sprintf(":%d\r\n", ackedCount)
 							conn.Write([]byte(response))
@@ -857,50 +684,50 @@ func handleClient(conn net.Conn) {
 						}
 					}
 				case <-timeout:
-					// Timeout expired, return the count of replicas that have acknowledged
+					// Timeout expired, return the count of s.replication.replicas that have acknowledged
 					response := fmt.Sprintf(":%d\r\n", ackedCount)
 					conn.Write([]byte(response))
 					break waitLoop
 				}
 			}
 
-			// All replicas responded (only reached if loop completes normally)
+			// All s.replication.replicas responded (only reached if loop completes normally)
 			if responsesReceived >= numReplicas {
 				response := fmt.Sprintf(":%d\r\n", ackedCount)
 				conn.Write([]byte(response))
 			}
 		case "MULTI":
-			transactionMutex.Lock()
-			transactionStates[conn] = true
-			transactionQueues[conn] = make([][]string, 0) // Initialize empty queue
-			transactionMutex.Unlock()
+			s.transactions.mutex.Lock()
+			s.transactions.states[conn] = true
+			s.transactions.queues[conn] = make([][]string, 0) // Initialize empty queue
+			s.transactions.mutex.Unlock()
 			conn.Write([]byte("+OK\r\n"))
 		case "EXEC":
-			transactionMutex.RLock()
-			inTransaction := transactionStates[conn]
-			transactionMutex.RUnlock()
+			s.transactions.mutex.RLock()
+			inTransaction := s.transactions.states[conn]
+			s.transactions.mutex.RUnlock()
 
 			if !inTransaction {
 				conn.Write([]byte("-ERR EXEC without MULTI\r\n"))
 			} else {
 				// Get the queued commands before cleaning up
-				transactionMutex.RLock()
-				queue := transactionQueues[conn]
-				transactionMutex.RUnlock()
+				s.transactions.mutex.RLock()
+				queue := s.transactions.queues[conn]
+				s.transactions.mutex.RUnlock()
 
 				// Execute queued commands and collect responses
 				var responses []string
 
 				for _, cmdArgs := range queue {
-					response := executeCommand(cmdArgs, conn)
+					response := s.executeCommand(cmdArgs, conn)
 					responses = append(responses, response)
 				}
 
 				// Clean up transaction state
-				transactionMutex.Lock()
-				delete(transactionStates, conn)
-				delete(transactionQueues, conn)
-				transactionMutex.Unlock()
+				s.transactions.mutex.Lock()
+				delete(s.transactions.states, conn)
+				delete(s.transactions.queues, conn)
+				s.transactions.mutex.Unlock()
 
 				// Send array of responses
 				result := fmt.Sprintf("*%d\r\n", len(responses))
@@ -910,18 +737,18 @@ func handleClient(conn net.Conn) {
 				conn.Write([]byte(result))
 			}
 		case "DISCARD":
-			transactionMutex.RLock()
-			inTransaction := transactionStates[conn]
-			transactionMutex.RUnlock()
+			s.transactions.mutex.RLock()
+			inTransaction := s.transactions.states[conn]
+			s.transactions.mutex.RUnlock()
 
 			if !inTransaction {
 				conn.Write([]byte("-ERR DISCARD without MULTI\r\n"))
 			} else {
 				// Clear transaction state and queued commands
-				transactionMutex.Lock()
-				delete(transactionStates, conn)
-				delete(transactionQueues, conn)
-				transactionMutex.Unlock()
+				s.transactions.mutex.Lock()
+				delete(s.transactions.states, conn)
+				delete(s.transactions.queues, conn)
+				s.transactions.mutex.Unlock()
 
 				conn.Write([]byte("+OK\r\n"))
 			}
@@ -932,9 +759,9 @@ func handleClient(conn net.Conn) {
 
 				switch paramName {
 				case "dir":
-					paramValue = configDir
+					paramValue = s.config.dir
 				case "dbfilename":
-					paramValue = configDbFilename
+					paramValue = s.config.dbFilename
 				default:
 					conn.Write([]byte("-ERR unknown config parameter\r\n"))
 					continue
@@ -953,12 +780,12 @@ func handleClient(conn net.Conn) {
 
 				// Only support "*" pattern for now
 				if pattern == "*" {
-					storeMutex.RLock()
-					keys := make([]string, 0, len(store))
-					for key := range store {
+					s.store.mutex.RLock()
+					keys := make([]string, 0, len(s.store.data))
+					for key := range s.store.data {
 						keys = append(keys, key)
 					}
-					storeMutex.RUnlock()
+					s.store.mutex.RUnlock()
 
 					// Build RESP array response
 					response := fmt.Sprintf("*%d\r\n", len(keys))
@@ -974,31 +801,31 @@ func handleClient(conn net.Conn) {
 				conn.Write([]byte("-ERR wrong number of arguments for 'keys' command\r\n"))
 			}
 		case "SUBSCRIBE":
-			handleSUBSCRIBE(args, conn)
+			s.handleSUBSCRIBE(args, conn)
 		case "PUBLISH":
-			handlePUBLISH(args, conn)
+			s.handlePUBLISH(args, conn)
 		case "UNSUBSCRIBE":
-			handleUNSUBSCRIBE(args, conn)
+			s.handleUNSUBSCRIBE(args, conn)
 		case "ZADD":
-			handleZADD(args, conn)
+			s.handleZADD(args, conn)
 		case "ZRANK":
-			handleZRANK(args, conn)
+			s.handleZRANK(args, conn)
 		case "ZRANGE":
-			handleZRANGE(args, conn)
+			s.handleZRANGE(args, conn)
 		case "ZCARD":
-			handleZCARD(args, conn)
+			s.handleZCARD(args, conn)
 		case "ZSCORE":
-			handleZSCORE(args, conn)
+			s.handleZSCORE(args, conn)
 		case "ZREM":
-			handleZREM(args, conn)
+			s.handleZREM(args, conn)
 		case "GEOADD":
-			handleGEOADD(args, conn)
+			s.handleGEOADD(args, conn)
 		case "GEOPOS":
-			handleGEOPOS(args, conn)
+			s.handleGEOPOS(args, conn)
 		case "GEODIST":
-			handleGEODIST(args, conn)
+			s.handleGEODIST(args, conn)
 		case "GEOSEARCH":
-			handleGEOSEARCH(args, conn)
+			s.handleGEOSEARCH(args, conn)
 		}
 	}
 }
@@ -1006,6 +833,9 @@ func handleClient(conn net.Conn) {
 func main() {
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	fmt.Println("Logs from your program will appear here!")
+
+	// Create server instance
+	s := NewServer()
 
 	port := "6379" // Default port
 
@@ -1018,21 +848,21 @@ func main() {
 			replicaofValue := os.Args[i+1]
 			parts := strings.Split(replicaofValue, " ")
 			if len(parts) == 2 {
-				isReplica = true
-				masterHost = parts[0]
-				masterPort = parts[1]
+				s.replication.isReplica = true
+				s.replication.masterHost = parts[0]
+				s.replication.masterPort = parts[1]
 			}
 		} else if arg == "--dir" && i+1 < len(os.Args) {
-			configDir = os.Args[i+1]
+			s.config.dir = os.Args[i+1]
 		} else if arg == "--dbfilename" && i+1 < len(os.Args) {
-			configDbFilename = os.Args[i+1]
+			s.config.dbFilename = os.Args[i+1]
 		}
 	}
 
 	// Load RDB file if dir and dbfilename are specified
-	if configDir != "" && configDbFilename != "" {
-		rdbPath := filepath.Join(configDir, configDbFilename)
-		if err := LoadRDB(rdbPath); err != nil {
+	if s.config.dir != "" && s.config.dbFilename != "" {
+		rdbPath := filepath.Join(s.config.dir, s.config.dbFilename)
+		if err := s.LoadRDB(rdbPath); err != nil {
 			fmt.Printf("Error loading RDB file: %s\n", err.Error())
 		} else {
 			fmt.Printf("Loaded RDB file from %s\n", rdbPath)
@@ -1040,9 +870,9 @@ func main() {
 	}
 
 	// If running as replica, connect to master and perform handshake
-	if isReplica {
+	if s.replication.isReplica {
 		go func() {
-			masterAddr := net.JoinHostPort(masterHost, masterPort)
+			masterAddr := net.JoinHostPort(s.replication.masterHost, s.replication.masterPort)
 			masterConn, err := net.Dial("tcp", masterAddr)
 			if err != nil {
 				fmt.Printf("Failed to connect to master at %s: %s\n", masterAddr, err.Error())
@@ -1167,9 +997,9 @@ func main() {
 					// Handle REPLCONF GETACK command
 					if len(args) >= 2 && strings.ToUpper(args[1]) == "GETACK" {
 						// Get current offset before updating it
-						replicaOffsetMutex.Lock()
-						currentOffset := replicaOffset
-						replicaOffsetMutex.Unlock()
+						s.replication.replicaOffsetMutex.Lock()
+						currentOffset := s.replication.replicaOffset
+						s.replication.replicaOffsetMutex.Unlock()
 
 						// Respond with REPLCONF ACK <offset>
 						offsetStr := strconv.Itoa(currentOffset)
@@ -1181,20 +1011,20 @@ func main() {
 						fmt.Printf("Sent REPLCONF ACK %d\n", currentOffset)
 
 						// Now update the offset to include this REPLCONF GETACK command
-						replicaOffsetMutex.Lock()
-						replicaOffset += bytesRead
-						replicaOffsetMutex.Unlock()
+						s.replication.replicaOffsetMutex.Lock()
+						s.replication.replicaOffset += bytesRead
+						s.replication.replicaOffsetMutex.Unlock()
 					} else {
 						// Other REPLCONF commands (not GETACK) - just update offset
-						replicaOffsetMutex.Lock()
-						replicaOffset += bytesRead
-						replicaOffsetMutex.Unlock()
+						s.replication.replicaOffsetMutex.Lock()
+						s.replication.replicaOffset += bytesRead
+						s.replication.replicaOffsetMutex.Unlock()
 					}
 				case "PING":
 					// PING command from master - just update offset
-					replicaOffsetMutex.Lock()
-					replicaOffset += bytesRead
-					replicaOffsetMutex.Unlock()
+					s.replication.replicaOffsetMutex.Lock()
+					s.replication.replicaOffset += bytesRead
+					s.replication.replicaOffsetMutex.Unlock()
 					fmt.Println("Replica processed PING")
 				case "SET":
 					if len(args) >= 3 {
@@ -1213,24 +1043,24 @@ func main() {
 							}
 						}
 
-						storeMutex.Lock()
-						store[key] = storeItem{value: value, expiry: expiry}
-						storeMutex.Unlock()
+						s.store.mutex.Lock()
+						s.store.data[key] = storeItem{value: value, expiry: expiry}
+						s.store.mutex.Unlock()
 
 						fmt.Printf("Replica processed SET %s %s\n", key, value)
 					}
 
 					// Update offset for SET command
-					replicaOffsetMutex.Lock()
-					replicaOffset += bytesRead
-					replicaOffsetMutex.Unlock()
+					s.replication.replicaOffsetMutex.Lock()
+					s.replication.replicaOffset += bytesRead
+					s.replication.replicaOffsetMutex.Unlock()
 				// Add other write commands here as needed
 				default:
 					fmt.Printf("Replica received command: %s\n", command)
 					// Update offset for unknown commands too
-					replicaOffsetMutex.Lock()
-					replicaOffset += bytesRead
-					replicaOffsetMutex.Unlock()
+					s.replication.replicaOffsetMutex.Lock()
+					s.replication.replicaOffset += bytesRead
+					s.replication.replicaOffsetMutex.Unlock()
 				}
 			}
 		}()
@@ -1249,6 +1079,6 @@ func main() {
 			continue
 		}
 
-		go handleClient(conn)
+		go s.handleClient(conn)
 	}
 }
